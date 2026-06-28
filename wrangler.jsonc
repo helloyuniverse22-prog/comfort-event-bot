@@ -17,7 +17,7 @@
   // JSONC を使う理由: 自動生成された database_id の「書き戻し」が .toml では行われない
   //   workers-sdk issue #13632 を避けるため。
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "discord-event-bot",
+  "name": "comfort-event-bot",
   "main": "src/index.ts",
   "compatibility_date": "2024-12-30",
   "compatibility_flags": ["nodejs_compat"],
