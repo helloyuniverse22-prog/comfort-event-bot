@@ -1,0 +1,316 @@
+/**
+ * D1 行・ドメイン型（Server[guild_id] ＞ Notification → Segment ＞ Occurrence）。
+ * 用語の定義は docs/dev/CONTEXT.md、スキーマは migrations/0002 + 0003(guild_id) + 0004(Event 廃止) を参照。
+ * 最上位スコープの Server は Discord API（bot の参加サーバー）から取得し DB には永続化しない（ADR 0004）。
+ */
+
+/** segments: 設定可能なメンバー区分（キャスト/スタッフ等） */
+export interface Segment {
+  id: number;
+  /** URL／API 表面用の UUID（ADR 0016）。内部結合は id を使う */
+  uuid: string;
+  guild_id: string;
+  name: string;
+  /** @メンション用 Discord ロールID / '@everyone' / null。設定時は「ロール管理区分」のメンバー源も兼ねる（ADR 0009） */
+  mention_role_id: string | null;
+  /** ロール管理区分のメンバーを Discord ロールから同期した最終時刻。null=未同期/手動区分（ADR 0009） */
+  members_synced_at: string | null;
+  created_at: string;
+}
+
+/**
+ * members: グローバルな人物マスタ。休止状態は SegmentMembership 側に持つ。
+ * display_name はギルドごとに member_guild_profiles が優先され（ADR 0022）、
+ * ギルドスコープのクエリでは COALESCE(gp.display_name, m.display_name) が入る。
+ * members.display_name 自体はギルド不明時（DM 由来等）のフォールバック。
+ */
+export interface Member {
+  user_id: string;
+  user_name: string | null;
+  display_name: string | null;
+  dm_channel_id: string | null;
+  created_at: string;
+}
+
+/** segment_members: 所属（Member × Segment）＋区分ごとの休止状態 */
+export interface SegmentMembership {
+  segment_id: number;
+  user_id: string;
+  /** '' = アクティブ / '休止中' */
+  status: string;
+  joined_at: string;
+}
+
+/** Member に所属ステータスを合成した型（区分メンバー一覧用） */
+export interface SegmentMember extends Member {
+  /** その区分での所属ステータス。'' = アクティブ / '休止中' */
+  status: string;
+}
+
+export type NotificationType = 'recurring' | 'oneoff';
+
+/**
+ * メンション方法（ADR 0010）。投稿が対象者をどう名指すか。
+ * - 'none': メンションしない
+ * - 'role': Segment のロール（または '@everyone'）をメンション（旧 mention_enabled=1 相当）
+ * - 'members': Segment のアクティブ Member を `<@id>` で個別列挙（少人数向け・超過は「ほかN名」）
+ */
+export type MentionMode = 'none' | 'role' | 'members';
+
+/** notifications: Server(guild_id) 配下の独立トラック */
+export interface Notification {
+  id: number;
+  /** URL／API 表面用の UUID（ADR 0016）。内部結合は id を使う */
+  uuid: string;
+  guild_id: string;
+  segment_id: number;
+  name: string;
+  channel_id: string;
+  type: NotificationType;
+  /** recurring 用 RFC5545 RRULE 文字列 */
+  rrule: string | null;
+  /** oneoff 用 'YYYY/MM/DD' */
+  one_off_date: string | null;
+  /**
+   * recurring の系列基準（隔週パリティ決定用の dtstart 起点・'YYYY/MM/DD'・null可）。
+   * UI では「次回の開催日」候補として提示する（「基準日」表記は廃語・ADR 0007）。
+   */
+  anchor_date: string | null;
+  /** 'HH:MM'（JST） */
+  start_time: string;
+  /**
+   * 開催時間（分）。From-To 表示用。null / 0 以下=未設定で開始時刻のみ「HH:MM〜」表示。
+   * 候補スロット共通の長さ（同一イベントの代替開始時刻のため）。
+   */
+  duration_minutes: number | null;
+  recruit_days_before: number;
+  remind_start_days: number;
+  remind_undecided_days: number;
+  /** 0/1 */
+  quota_enabled: number;
+  quota_interval_days: number | null;
+  /** 0/1 */
+  assignment_enabled: number;
+  /** 0/1 グループ分け機能を有効にするか（ADR 0015） */
+  grouping_enabled: number;
+  /**
+   * @deprecated mention_mode へ移行（ADR 0010）。列は後方互換で残すが本体は参照しない。
+   * 0/1 対象 Segment の Discord ロールへ @メンションするか
+   */
+  mention_enabled: number;
+  /** メンション方法（ADR 0010）。'none' | 'role' | 'members' */
+  mention_mode: MentionMode;
+  /**
+   * recurring が出欠回答を集めるか（0/1）。0=回答不要（通知のみ・ボタンなし）で、
+   * 未回答/未定リマインド・ノルマ・番号割り当ては対象外。oneoff は常に 1（ADR 0010）。
+   */
+  requires_response: number;
+  /** 投稿の見出し（必須・1 行）。チャンネルへの募集/告知投稿の1行目に **太字** で出る（ADR 0010）。 */
+  message_title: string;
+  /** 投稿本文（任意・複数行）。NULL/空なら省略。日時行とボタンはシステムが自動付加（ADR 0010）。 */
+  message_body: string | null;
+  /** 0/1 */
+  active: number;
+  /**
+   * 単発・複数候補日で確定した開催回の id（occurrences.id）。NULL=未確定。
+   * 確定すると当該回以外の候補は cancelled になり、cron はこの回のみを対象にする。
+   */
+  decided_occurrence_id: number | null;
+  /**
+   * 回答締切（ADR 0014）。開催開始の N 時間前を「これ以降は変更しないで」の境界とする。
+   * NULL=締切なし。締切後の Response 変更（未回答→回答含む）を検知して通知し、回答履歴で識別する。
+   */
+  response_deadline_hours: number | null;
+  /** 締切後変更の通知先チャンネル（ADR 0014）。NULL=通知の channel_id にフォールバック。 */
+  change_alert_channel_id: string | null;
+  /** メンバー配置結果の投稿先チャンネル（マスター設定）。NULL=通知の channel_id にフォールバック。 */
+  grouping_channel_id: string | null;
+  /**
+   * cron 駆動送信（募集/未回答・未定リマインド/ノルマ/締切告知）を JST の何時に送るか（0〜23・ADR 0013）。
+   * 開催の start_time とは別物。既定 21（従来の cron 固定 21:00 踏襲）。
+   */
+  send_hour: number;
+  created_at: string;
+}
+
+/** 通知一覧表示用に集計列を付与した行（候補数・確定回の日時）。一覧クエリのみで返す。 */
+export interface NotificationListItem extends Notification {
+  /** status='scheduled' の occurrences 件数（単発の候補数。確定後は1） */
+  candidate_count: number;
+  /** decided_occurrence_id の開催日（未確定は null） */
+  decided_date: string | null;
+  /** decided_occurrence_id の開始時刻（未確定は null） */
+  decided_time: string | null;
+}
+
+export type OccurrenceStatus = 'scheduled' | 'cancelled';
+
+/** occurrences: Notification の 1 開催回（単発の複数候補では「日付＋時刻」のスロット1つ） */
+export interface Occurrence {
+  id: number;
+  /** URL／API 表面用の UUID（ADR 0016）。内部結合は id を使う */
+  uuid: string;
+  notification_id: number;
+  /** 'YYYY/MM/DD'（JST・ゼロ埋めで辞書順=時系列順） */
+  occurrence_date: string;
+  /** 'HH:MM'（JST）。このスロットの開始時刻。空文字は通知の start_time で補完して表示 */
+  start_time: string;
+  status: OccurrenceStatus;
+  created_at: string;
+}
+
+/** responses: 開催回への 1 Member の回答（旧 event_log） */
+export interface Response {
+  occurrence_id: number;
+  user_id: string;
+  user_name: string | null;
+  /** 参加 / 不参加 / 未定 */
+  status: string;
+  updated_at: string;
+  /** 締切後に変更された回答か（0/1・ADR 0014）。回答履歴で「締切後変更」列として表示する。 */
+  post_deadline_change: number;
+}
+
+/** 出欠状況の集計結果（表示名の配列） */
+export type EventStatusBuckets = {
+  参加: string[];
+  不参加: string[];
+  未定: string[];
+  未回答: string[];
+};
+
+/** ノルマ未達メンバー */
+export interface QuotaAlert extends Member {
+  daysSinceLast: number;
+  lastDateStr: string;
+}
+
+/** 表示名を解決（display_name > user_name > user_id） */
+export function resolveDisplayName(m: Member): string {
+  return m.display_name || m.user_name || m.user_id;
+}
+
+// ponytail: (b) 既存の dailyCheck/admin に散らばる「回答不要」判定を 1 本化（ADR 0010）。
+/** 回答不要（通知のみ）か。recurring かつ requires_response=0 のとき true。 */
+export function isAnnounceOnly(n: Pick<Notification, 'type' | 'requires_response'>): boolean {
+  return n.type === 'recurring' && !n.requires_response;
+}
+
+/**
+ * send_log の送信種別（ADR 0013）。cron 駆動のペース配信のみが対象で、いずれも
+ * 「(通知, 開催回, 宛先, 種別, 送信日) で 1 日 1 回」の冪等。締切後変更の即時通知（change_alert）は
+ * interaction 時の処理で send_log には記録しない（responses.post_deadline_change が durable な記録）。
+ */
+export type SendLogKind =
+  | 'recruit'
+  | 'remind_unanswered'
+  | 'remind_undecided'
+  | 'quota'
+  | 'deadline_notice';
+
+/** send_log: cron 駆動送信の記録（冪等台帳 兼 ペースカーソル 兼 可視化・ADR 0013） */
+export interface SendLog {
+  id: number;
+  notification_id: number;
+  /** 開催回 id。0 = 開催回に紐づかない（ノルマ等） */
+  occurrence_id: number;
+  /** DM 宛先 user_id。'' = チャンネル投稿（個人宛なし） */
+  user_id: string;
+  kind: SendLogKind;
+  /** 'YYYY/MM/DD'(JST)。同日冪等の鍵 */
+  send_date: string;
+  /** sent | failed */
+  status: string;
+  /** 失敗理由（DM 拒否等）。成功時 null */
+  error: string | null;
+  created_at: string;
+}
+
+/** リマインド送信履歴の一覧表示用（send_log に通知名/開催日を合成・admin 閲覧用） */
+export interface SendLogListItem extends SendLog {
+  notification_name: string;
+  /** 宛先の表示名（display_name > user_name）。members に無ければ null（UI は user_id 表示にフォールバック） */
+  user_name: string | null;
+  occurrence_date: string | null;
+}
+
+/**
+ * グループ分け（Grouping）関連の型（ADR 0015）。
+ * Occurrence 単位で 1 つ作成し、参加者を group_count 個の Group に分割する。
+ */
+
+/** ペア制約の方向 */
+export type ConstraintDirection = 'together' | 'apart';
+/** ペア制約の強度 */
+export type ConstraintStrength = 'required' | 'preferred';
+
+/** groupings: 1 Occurrence あたり 1 つ */
+export interface Grouping {
+  id: number;
+  /** URL／API 表面用の UUID（ADR 0016） */
+  uuid: string;
+  occurrence_id: number;
+  group_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** groups: グループ実体（表示順と名前を持つ） */
+export interface Group {
+  id: number;
+  /** URL／API 表面用の UUID（ADR 0016） */
+  uuid: string;
+  grouping_id: number;
+  group_index: number;
+  name: string;
+  /** 自動連番の開始番号（既定 1・ADR 0015 追補2拡張） */
+  start_no: number;
+}
+
+/** group_members: グループへのメンバー所属 */
+export interface GroupMember {
+  group_id: number;
+  user_id: string;
+}
+
+/** grouping_constraints: Notification 単位のペア制約 */
+export interface GroupingConstraint {
+  id: number;
+  /** URL／API 表面用の UUID（ADR 0016） */
+  uuid: string;
+  notification_id: number;
+  /** ペアは a < b で正規化して保存 */
+  user_id_a: string;
+  user_id_b: string;
+  direction: ConstraintDirection;
+  strength: ConstraintStrength;
+  created_at: string;
+}
+
+/** API 応答用: Group + メンバー一覧（表示名付き） */
+export interface GroupWithMembers {
+  id: number;
+  /** URL／API 表面用の UUID（ADR 0016）。クライアントの DOM data 属性キー・rename/move 等の参照キーに使う */
+  uuid: string;
+  group_index: number;
+  name: string;
+  /** 自動連番の開始番号（既定 1） */
+  start_no: number;
+  /** label: 行頭ラベルの上書き（開催回×メンバー単位・null=自動連番・ADR 0015 追補2） */
+  members: { user_id: string; name: string; label: string | null }[];
+}
+
+/** API 応答用: Grouping の全体ビュー */
+export interface GroupingView {
+  grouping: Grouping | null;
+  groups: GroupWithMembers[];
+  /** 未割り当ての参加者（プール） */
+  pool: { user_id: string; name: string }[];
+  /** 保存後に「不参加」に変わった or 既存メンバーで未割り当てだが現在も「参加」のメンバー差分情報 */
+  diff: {
+    /** グループに入っているが現在は参加していないメンバー（保存時 vs 現在） */
+    no_longer_participating: { user_id: string; name: string; group_id: number }[];
+    /** 現在「参加」だがどのグループにも入っていない新規参加者 */
+    newly_participating: { user_id: string; name: string }[];
+  };
+}

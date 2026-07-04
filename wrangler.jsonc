@@ -1,0 +1,73 @@
+{
+  // ★ Wrangler 設定（全ブランチ共通・unified）★
+  //
+  // base（トップレベル）= 配布用設定: fork を接続した Cloudflare Workers Builds がこの
+  //   ファイルを読み、`name` の Worker と `database_name` の D1 を自動生成（同名があれば
+  //   再利用）してデプロイする。利用者の Deploy command は `npm run deploy`。
+  //
+  // env.staging = 保守者の検証環境用の上書き（`wrangler deploy --env staging`）。
+  //   利用者が使うことはない。
+  //   ★ 保守者向け: staging の Workers Builds プロジェクトの Deploy command は必ず
+  //     `npm run deploy:staging` にすること（素の `npm run deploy` は base の Worker を
+  //     狙うため事故になる）。
+  //
+  // JSONC を使う理由: 自動生成された database_id の「書き戻し」が .toml では行われない
+  //   workers-sdk issue #13632 を避けるため。
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "discord-event-bot",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-12-30",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // --- D1 データベース（base = 配布）---
+  // database_id は記載しない（省略）。Cloudflare の自動プロビジョニングは
+  // 「id 無しバインディング ＝ 同名既存 D1 を再利用、無ければ新規作成」と動く。
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "choiemu-event-bot-db",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // --- cron（毎分のペース配信。実送信は通知ごとの send_hour で時刻ゲート＋予算ドレイン。
+  //     send_log による冪等化で毎分実行でも二重送信しない）---
+  // env.staging へは継承される（再記述不要）。
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+
+  // --- 管理UI（静的アセット）---
+  // ui/ を SPA として配信。env.ASSETS でプログラムからも参照可能。
+  // env.staging へは継承される（再記述不要）。
+  "assets": {
+    "directory": "./ui",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+
+  // --- staging（保守者の検証環境）上書き ---
+  // `wrangler deploy --env staging` で適用。利用者は使用しない。
+  // `name` は base + `-staging` の自動サフィックスと同値だが明示する（Cloudflare Workers
+  // Builds の静的チェックが top-level `name` しか見ずに「設定不一致」警告や自動修正 PR を
+  // 出すことへの対策。自動 PR が top-level `name` の書き換えを提案してきても merge しないこと）。
+  // d1_databases は環境継承されないキーのため全項目を再記述する。id を明記して
+  // 自動プロビジョニングの曖昧性を排除している。
+  "env": {
+    "staging": {
+      "name": "discord-event-bot-staging",
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "choiemu-event-bot-db-staging",
+          "database_id": "43d98794-8b33-4114-867d-296b2d2697f2",
+          "migrations_dir": "migrations"
+        }
+      ]
+    }
+  }
+
+  // シークレットは Worker の Variables and Secrets、または wrangler secret put で設定（コミットしない）:
+  //   DISCORD_PUBLIC_KEY / DISCORD_APPLICATION_ID / DISCORD_BOT_TOKEN / ADMIN_TOKEN
+  // ※ 投稿チャンネルは Notification ごとに DB で持つため、単一の DISCORD_CHANNEL_ID は廃止。
+}

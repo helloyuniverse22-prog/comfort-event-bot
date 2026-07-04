@@ -1,0 +1,62 @@
+{
+  "name": "discord-event-bot",
+  "version": "9.0.0",
+  "description": "汎用 Discord イベント出欠 Bot（Cloudflare Workers + D1・管理UI付き）。マルチサーバー対応・Server ＞ Notification → Segment ＞ Occurrence モデル。",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "node scripts/derive-db-name.mjs && wrangler deploy && npm run db:migrate:remote",
+    "deploy:staging": "wrangler deploy --env staging && wrangler d1 migrations apply DB --remote --env staging",
+    "deploy:cli": "wrangler d1 migrations apply DB --remote --config wrangler.local.jsonc && wrangler deploy --config wrangler.local.jsonc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
+    "db:migrate:remote:staging": "wrangler d1 migrations apply DB --remote --env staging",
+    "register-commands": "node --env-file=.env scripts/register-commands.js",
+    "build:tables": "node design-system/build-ui-tables.mjs",
+    "build:sortable": "node design-system/build-ui-sortable.mjs"
+  },
+  "dependencies": {
+    "rrule": "^2.8.1"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.16.16",
+    "@cloudflare/workers-types": "^4.20260617.1",
+    "sortablejs": "^1.15.7",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.9",
+    "wrangler": "^4.102.0"
+  },
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "packageManager": "npm@10.9.2",
+  "overrides": {
+    "@emnapi/core": "1.10.0",
+    "@emnapi/runtime": "1.10.0"
+  },
+  "cloudflare": {
+    "label": "Discord イベント出欠 Bot",
+    "products": [
+      "Workers",
+      "D1"
+    ],
+    "bindings": {
+      "DISCORD_PUBLIC_KEY": {
+        "description": "Discord アプリの公開鍵。Developer Portal → アプリ → General Information の PUBLIC KEY をコピーして貼り付け。"
+      },
+      "DISCORD_APPLICATION_ID": {
+        "description": "Discord アプリの ID。Developer Portal → アプリ → General Information の APPLICATION ID をコピーして貼り付け。"
+      },
+      "DISCORD_BOT_TOKEN": {
+        "description": "Bot のトークン（秘密）。Developer Portal → アプリ → Bot → Reset Token で表示・コピーして貼り付け。"
+      },
+      "ADMIN_TOKEN": {
+        "description": "管理画面のパスワード（自分で決める長いランダム文字列）。同梱の setup.html の「パスワードを生成する」で作れます。"
+      }
+    }
+  }
+}

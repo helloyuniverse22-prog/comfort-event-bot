@@ -1,0 +1,217 @@
+import { describe, it, expect } from 'vitest';
+import { env } from 'cloudflare:test';
+import { createSegment, addSegmentMember } from '../src/db/segments';
+import { addMember } from '../src/db/members';
+import { upsertResponse, getStatusBuckets } from '../src/db/responses';
+import {
+  createNotification,
+  getNotification,
+  updateNotification,
+  listNotificationsByGuild,
+  decideOccurrence,
+  undecideNotification,
+  type NotificationInput,
+} from '../src/db/notifications';
+import {
+  syncCandidateOccurrences,
+  listScheduledOccurrences,
+  getOccurrence,
+  getOrCreateOccurrence,
+} from '../src/db/occurrences';
+
+const db = () => env.DB;
+
+/** 単発(oneoff)の NotificationInput を組み立てる */
+function oneoffInput(
+  guildId: string,
+  segmentId: number,
+  over: Partial<NotificationInput> = {},
+): NotificationInput {
+  return {
+    guild_id: guildId,
+    segment_id: segmentId,
+    name: '単発テスト',
+    channel_id: 'c1',
+    type: 'oneoff',
+    rrule: null,
+    one_off_date: null,
+    anchor_date: null,
+    start_time: '21:00',
+    duration_minutes: null,
+    recruit_days_before: 7,
+    remind_start_days: 3,
+    remind_undecided_days: 1,
+    quota_enabled: 0,
+    quota_interval_days: null,
+    assignment_enabled: 0,
+    grouping_enabled: 0,
+    mention_mode: 'role',
+    requires_response: 1,
+    message_title: '単発テスト',
+    message_body: null,
+    active: 1,
+    response_deadline_hours: null,
+    change_alert_channel_id: null,
+    send_hour: 21,
+    ...over,
+  };
+}
+
+const dt = (o: { occurrence_date: string; start_time: string }) =>
+  `${o.occurrence_date} ${o.start_time}`;
+
+describe('syncCandidateOccurrences（候補スロット=日付+時刻 の同期）', () => {
+  it('スロットを occurrences として作成し、(日付,時刻) 昇順で scheduled を返す', async () => {
+    const seg = await createSegment(db(), { guild_id: 'g1', name: 'メンバー', mention_role_id: null });
+    const n = await createNotification(db(), oneoffInput('g1', seg.id));
+    const occs = await syncCandidateOccurrences(db(), n.id, [
+      { date: '2025/03/20', time: '21:00' },
+      { date: '2025/03/10', time: '21:00' },
+      { date: '2025/03/15', time: '19:00' },
+    ]);
+    expect(occs.map(dt)).toEqual(['2025/03/10 21:00', '2025/03/15 19:00', '2025/03/20 21:00']);
+    expect(occs.every((o) => o.status === 'scheduled')).toBe(true);
+  });
+
+  it('同一日に複数の時刻スロットが共存できる（旧 UNIQUE 違反しない）', async () => {
+    const seg = await createSegment(db(), { guild_id: 'g1', name: 'メンバー', mention_role_id: null });
+    const n = await createNotification(db(), oneoffInput('g1', seg.id));
+    const occs = await syncCandidateOccurrences(db(), n.id, [
+      { date: '2025/03/15', time: '21:00' },
+      { date: '2025/03/15', time: '19:00' },
+    ]);
+    expect(occs).toHaveLength(2);
+    expect(occs.map((o) => o.start_time)).toEqual(['19:00', '21:00']); // 時刻昇順
+    expect(new Set(occs.map((o) => o.id)).size).toBe(2); // 別 occurrence
+  });
+
+  it('外したスロットは cancelled・回答保全、再追加で同一 id が復活（id は安定）', async () => {
+    const seg = await createSegment(db(), { guild_id: 'g1', name: 'メンバー', mention_role_id: null });
+    const n = await createNotification(db(), oneoffInput('g1', seg.id));
+    const created = await syncCandidateOccurrences(db(), n.id, [
+      { date: '2025/03/15', time: '19:00' },
+      { date: '2025/03/15', time: '21:00' },
+    ]);
+    const slot19 = created.find((o) => o.start_time === '19:00')!;
+    await addMember(db(), 'u1', 'n1', 'D1');
+    await upsertResponse(db(), slot19.id, 'u1', 'n1', '参加');
+
+    // 19:00 を外す → cancelled、scheduled は 21:00 のみ
+    const after = await syncCandidateOccurrences(db(), n.id, [{ date: '2025/03/15', time: '21:00' }]);
+    expect(after.map((o) => o.start_time)).toEqual(['21:00']);
+    expect((await getOccurrence(db(), slot19.id))?.status).toBe('cancelled');
+    const resp = await db()
+      .prepare('SELECT status FROM responses WHERE occurrence_id = ? AND user_id = ?')
+      .bind(slot19.id, 'u1')
+      .first<{ status: string }>();
+    expect(resp?.status).toBe('参加'); // 回答は保全
+
+    // 再追加で同一 id が scheduled に復活
+    const restored = await syncCandidateOccurrences(db(), n.id, [
+      { date: '2025/03/15', time: '19:00' },
+      { date: '2025/03/15', time: '21:00' },
+    ]);
+    const back = restored.find((o) => o.start_time === '19:00');
+    expect(back?.id).toBe(slot19.id);
+    expect(back?.status).toBe('scheduled');
+  });
+});
+
+describe('getOrCreateOccurrence（スロット単位の取得/生成・後方互換の再利用）', () => {
+  it('同一 (date,time) は既存を返し、同日でも時刻違いは新規スロットを作る', async () => {
+    const seg = await createSegment(db(), { guild_id: 'g1', name: 'メンバー', mention_role_id: null });
+    const n = await createNotification(db(), oneoffInput('g1', seg.id));
+    const a = await getOrCreateOccurrence(db(), n.id, '2025/03/15', '19:00');
+    const again = await getOrCreateOccurrence(db(), n.id, '2025/03/15', '19:00');
+    expect(again.id).toBe(a.id); // 同一スロットは重複生成しない（lookup が start_time を含む）
+    const b = await getOrCreateOccurrence(db(), n.id, '2025/03/15', '21:00');
+    expect(b.id).not.toBe(a.id); // 同日でも時刻違いは別スロット
+    expect(b.start_time).toBe('21:00');
+  });
+});
+
+describe('スロットごとの独立した出欠集計', () => {
+  it('同一日でも時刻スロットごとに別々の回答を持てる', async () => {
+    const seg = await createSegment(db(), { guild_id: 'g1', name: 'メンバー', mention_role_id: null });
+    const n = await createNotification(db(), oneoffInput('g1', seg.id));
+    const occs = await syncCandidateOccurrences(db(), n.id, [
+      { date: '2025/03/15', time: '19:00' },
+      { date: '2025/03/15', time: '21:00' },
+    ]);
+    const s19 = occs[0];
+    const s21 = occs[1];
+    await addMember(db(), 'u1', 'n1', 'D1');
+    await addSegmentMember(db(), seg,'u1');
+    await upsertResponse(db(), s19.id, 'u1', 'n1', '参加');
+    await upsertResponse(db(), s21.id, 'u1', 'n1', '不参加');
+
+    const b19 = await getStatusBuckets(db(), s19.id, seg.id);
+    const b21 = await getStatusBuckets(db(), s21.id, seg.id);
+    expect(b19.参加).toEqual(['D1']);
+    expect(b21.不参加).toEqual(['D1']);
+  });
+});
+
+describe('duration_minutes と一覧の集計列（候補数・確定日時）', () => {
+  it('createNotification で duration を保存し、update で更新できる', async () => {
+    const seg = await createSegment(db(), { guild_id: 'gd', name: 'メンバー', mention_role_id: null });
+    const n = await createNotification(db(), oneoffInput('gd', seg.id, { duration_minutes: 120 }));
+    expect((await getNotification(db(), n.id))?.duration_minutes).toBe(120);
+
+    await updateNotification(db(), n.id, oneoffInput('gd', seg.id, { duration_minutes: 90 }));
+    expect((await getNotification(db(), n.id))?.duration_minutes).toBe(90);
+
+    // 未設定(null)も保持できる
+    await updateNotification(db(), n.id, oneoffInput('gd', seg.id, { duration_minutes: null }));
+    expect((await getNotification(db(), n.id))?.duration_minutes).toBeNull();
+  });
+
+  it('一覧は候補数を返し、確定すると候補1・decided_date/time が確定回を指す', async () => {
+    const seg = await createSegment(db(), { guild_id: 'gd2', name: 'メンバー', mention_role_id: null });
+    const n = await createNotification(db(), oneoffInput('gd2', seg.id, { duration_minutes: 90 }));
+    await syncCandidateOccurrences(db(), n.id, [
+      { date: '2025/04/01', time: '19:00' },
+      { date: '2025/04/02', time: '20:00' },
+      { date: '2025/04/03', time: '21:00' },
+    ]);
+
+    let row = (await listNotificationsByGuild(db(), 'gd2')).find((x) => x.id === n.id)!;
+    expect(row.candidate_count).toBe(3);
+    expect(row.decided_date).toBeNull();
+    expect(row.decided_time).toBeNull();
+    expect(row.duration_minutes).toBe(90);
+
+    // 2番目（最早でない）を確定 → 他候補 cancelled・候補1・decided_date/time が確定回
+    const occs = await listScheduledOccurrences(db(), n.id);
+    const chosen = occs[1]; // 2025/04/02 20:00
+    await decideOccurrence(db(), n.id, chosen.id);
+
+    row = (await listNotificationsByGuild(db(), 'gd2')).find((x) => x.id === n.id)!;
+    expect(row.candidate_count).toBe(1);
+    expect(row.decided_date).toBe('2025/04/02');
+    expect(row.decided_time).toBe('20:00');
+  });
+});
+
+describe('decideOccurrence / undecideNotification（スロット確定）', () => {
+  it('あるスロットを確定すると同日他スロットも含め他候補が cancelled になる', async () => {
+    const seg = await createSegment(db(), { guild_id: 'g1', name: 'メンバー', mention_role_id: null });
+    const n = await createNotification(db(), oneoffInput('g1', seg.id));
+    const occs = await syncCandidateOccurrences(db(), n.id, [
+      { date: '2025/03/15', time: '19:00' },
+      { date: '2025/03/15', time: '21:00' },
+      { date: '2025/03/20', time: '20:00' },
+    ]);
+    const chosen = occs[0]; // 2025/03/15 19:00
+
+    await decideOccurrence(db(), n.id, chosen.id);
+    const scheduled = await listScheduledOccurrences(db(), n.id);
+    expect(scheduled.map((o) => o.id)).toEqual([chosen.id]);
+    expect((await getNotification(db(), n.id))?.decided_occurrence_id).toBe(chosen.id);
+
+    await undecideNotification(db(), n.id);
+    const restored = await listScheduledOccurrences(db(), n.id);
+    expect(restored.map(dt)).toEqual(['2025/03/15 19:00', '2025/03/15 21:00', '2025/03/20 20:00']);
+    expect((await getNotification(db(), n.id))?.decided_occurrence_id).toBeNull();
+  });
+});

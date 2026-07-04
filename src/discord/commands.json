@@ -1,0 +1,16 @@
+[
+  {
+    "name": "notify",
+    "description": "通知を選んで募集メッセージを今すぐ送信します (管理者用)",
+    "default_member_permissions": "8"
+  },
+  {
+    "name": "help",
+    "description": "Bot の使い方とコマンド一覧を表示します"
+  },
+  {
+    "name": "manage",
+    "description": "管理画面の URL を表示します (管理者用)",
+    "default_member_permissions": "8"
+  }
+]

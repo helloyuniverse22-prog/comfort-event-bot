@@ -1,0 +1,51 @@
+node_modules/
+.env
+# Credentials and Secrets
+service-account.json
+credentials.json
+client_secret.json
+*.pem
+*.key
+
+# Logs
+*.log
+npm-debug.log*
+
+# Runtime
+.DS_Store
+Thumbs.db
+
+# Vercel
+.vercel
+
+# Cloudflare / Wrangler
+.wrangler/
+.dev.vars
+dist/
+*.tsbuildinfo
+
+# 保守者ローカル専用の wrangler 上書き設定（実 database_id を含む・配布しない）
+wrangler.local.jsonc
+
+# 移行で生成される実データ（PII含む・コミット禁止）
+scripts/seed.sql
+
+# シークレット一括投入用ファイル（コミット禁止）
+secrets*.json
+
+# 検証アーティファクト（Playwright スクショ等・コミット不要）
+.playwright-mcp/
+verify-*.png
+
+# setup.html 手順書の元スクショ（中間生成物・base64で本体に埋め込むため非コミット）
+.captures/
+
+# 本番 D1 のローカルバックアップ（PII含む・コミット禁止）
+.backups/
+
+# /design-sync の作業物（ステージングスクリプト・生成バンドル・キャッシュ・fork symlink）
+.ds-sync/
+ds-bundle/
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules
