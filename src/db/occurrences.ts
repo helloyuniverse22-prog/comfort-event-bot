@@ -1,7 +1,7 @@
 import type { Occurrence, OccurrenceStatus } from './types';
 import { newUuid } from './uuid';
 
-const COLS = 'id, uuid, notification_id, occurrence_date, start_time, status, created_at';
+const COLS = 'id, uuid, notification_id, occurrence_date, start_time, status, note, created_at';
 
 /**
  * Occurrence を取得 or 生成。UNIQUE(notification_id, occurrence_date, start_time) で upsert。
@@ -41,6 +41,7 @@ export async function getOrCreateOccurrence(
       occurrence_date: dateStr,
       start_time: startTime,
       status: 'scheduled',
+      note: null,
       created_at: '',
     }
   );
@@ -92,6 +93,58 @@ export async function setOccurrenceStatus(
   const res = await db
     .prepare('UPDATE occurrences SET status = ? WHERE id = ?')
     .bind(status, id)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+/**
+ * 今日以降の開催回を全通知ぶん一括取得する（両ステータス・日付昇順）。
+ * 毎分 cron の対象決定用: 通知ごとの個別クエリを避け、1 ティック 1 クエリに抑える。
+ */
+export async function listFutureOccurrencesAll(
+  db: D1Database,
+  todayStr: string,
+): Promise<Occurrence[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT ${COLS} FROM occurrences
+        WHERE occurrence_date >= ?
+        ORDER BY occurrence_date ASC, start_time ASC`,
+    )
+    .bind(todayStr)
+    .all<Occurrence>();
+  return results;
+}
+
+/**
+ * その通知のその日付に中止（cancelled）の回があるか（時刻は無視）。
+ * recurring の送信ゲート用の墓石照合。通知の start_time を変更しても
+ * 「その日を中止した」意図が生き残るよう、日付だけで判定する。
+ */
+export async function hasCancelledOccurrenceOnDate(
+  db: D1Database,
+  notificationId: number,
+  dateStr: string,
+): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT 1 AS x FROM occurrences
+        WHERE notification_id = ? AND occurrence_date = ? AND status = 'cancelled' LIMIT 1`,
+    )
+    .bind(notificationId, dateStr)
+    .first<{ x: number }>();
+  return !!row;
+}
+
+/** 補足メッセージを更新（NULL=なし）。対象が無ければ false */
+export async function setOccurrenceNote(
+  db: D1Database,
+  id: number,
+  note: string | null,
+): Promise<boolean> {
+  const res = await db
+    .prepare('UPDATE occurrences SET note = ? WHERE id = ?')
+    .bind(note, id)
     .run();
   return (res.meta.changes ?? 0) > 0;
 }

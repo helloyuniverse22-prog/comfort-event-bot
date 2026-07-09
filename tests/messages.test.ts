@@ -31,6 +31,23 @@ describe('buildStatusMessage（種別で見出し・回答ラベル切替）', (
     expect(msg).toContain('参加状況');
     expect(msg).toContain('参加 (3名)');
   });
+  it('名前一覧は subtext（-#）で表示する', () => {
+    const msg = buildStatusMessage('2026/06/20', bk(2, 0, 0, 1), 'recurring');
+    expect(msg).toContain('\n-# p、p');
+    expect(msg).toContain('\n-# (なし)');
+  });
+  it('myAnswer を渡すと先頭に「あなたの回答」行が付く（null=未回答）', () => {
+    const answered = buildStatusMessage('2026/06/20', bk(1), 'recurring', '参加');
+    expect(answered).toContain('👤 あなたの回答: **⭕ 参加**');
+    const unanswered = buildStatusMessage('2026/06/20', bk(1), 'recurring', null);
+    expect(unanswered).toContain('👤 あなたの回答: **⚠️ 未回答**');
+    const omitted = buildStatusMessage('2026/06/20', bk(1), 'recurring');
+    expect(omitted).not.toContain('あなたの回答');
+  });
+  it('oneoff の「あなたの回答」は 可/不可/未確定 表記になる', () => {
+    const msg = buildStatusMessage('2026/06/20', bk(1), 'oneoff', '未定');
+    expect(msg).toContain('👤 あなたの回答: **❓ 未確定**');
+  });
 });
 
 describe('buildAllStatusMessage（全候補集計・2000字ガード）', () => {
@@ -65,5 +82,17 @@ describe('buildAllStatusMessage（全候補集計・2000字ガード）', () => 
     expect(msg).not.toContain('…ほか');
     expect(msg).toContain('A 21:00〜22:00');
     expect(msg).toContain('B 22:00〜23:00');
+  });
+
+  it('mine があれば候補ごとに自分の回答を付ける（null=未回答・省略時は付かない）', () => {
+    const rows = [
+      { label: 'A', buckets: bk(1), mine: '参加' },
+      { label: 'B', buckets: bk(0, 1), mine: null },
+      { label: 'C', buckets: bk(0, 0, 1) },
+    ];
+    const msg = buildAllStatusMessage('回答付き', rows, 'oneoff');
+    expect(msg).toContain('👤 あなた: ⭕ 可');
+    expect(msg).toContain('👤 あなた: ⚠️ 未回答');
+    expect((msg.match(/👤/g) || []).length).toBe(2);
   });
 });
