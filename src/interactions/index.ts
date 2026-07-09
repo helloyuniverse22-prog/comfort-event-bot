@@ -339,6 +339,7 @@ async function handleButton(
         occs.map(async (o) => ({
           label: formatOccurrenceLabel(o.occurrence_date, o.start_time || n.start_time, n.duration_minutes),
           buckets: await getStatusBuckets(db, o.id, n.segment_id, members),
+          mine: await getResponseStatus(db, o.id, userId),
         })),
       );
       return ephemeral(buildAllStatusMessage(n.name, rows, n.type));
@@ -357,7 +358,8 @@ async function handleButton(
       if (!n) return ephemeral('❌ 対象の通知が見つかりません。');
       const buckets = await getStatusBuckets(db, occ.id, n.segment_id);
       const title = formatOccurrenceLabel(occ.occurrence_date, occ.start_time || n.start_time, n.duration_minutes);
-      return ephemeral(buildStatusMessage(title, buckets, n.type));
+      const mine = await getResponseStatus(db, occ.id, userId);
+      return ephemeral(buildStatusMessage(title, buckets, n.type, mine));
     } catch (e) {
       console.error('[Button] status error:', (e as Error).message);
       return ephemeral('❌ 状況確認に失敗しました。');
@@ -370,6 +372,10 @@ async function handleButton(
   try {
     const occ = await getOccurrence(db, occurrenceId);
     if (!occ) return ephemeral('❌ 対象の開催回が見つかりません。');
+    // 中止（単発の候補落ち含む）の回は回答を受け付けない。
+    if (occ.status === 'cancelled') {
+      return ephemeral('⛔ この開催回は中止（または候補から除外）されたため、回答できません。');
+    }
     const n = await getNotification(db, occ.notification_id);
     if (!n) return ephemeral('❌ 対象の通知が見つかりません。');
 

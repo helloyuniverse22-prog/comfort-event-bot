@@ -32,12 +32,15 @@ import {
 } from '../db/notifications';
 import {
   getOccurrenceByUuid,
+  getOrCreateOccurrence,
+  setOccurrenceNote,
   setOccurrenceStatus,
   updateOccurrenceDate,
   listOccurrencesForNotification,
   syncCandidateOccurrences,
   type CandidateSlot,
 } from '../db/occurrences';
+import { nextOccurrenceDates } from '../lib/recurrence';
 import { getResponsesForOccurrence, getStatusBuckets, listRecentResponses } from '../db/responses';
 import {
   getGroupingView,
@@ -55,11 +58,11 @@ import {
   autoAssign,
 } from '../db/groupings';
 import type { ConstraintDirection, ConstraintStrength, GroupingView } from '../db/types';
-import { listSendLog } from '../db/sendLog';
-import { getAllConfig, setConfig, getSendBudget } from '../db/config';
+import { claimSend, finishSend, listSendLog, reclaimFailedSend, reclaimSentSend } from '../db/sendLog';
+import { getAllConfig, setConfig, getSendBudget, OCC_ROLLFORWARD_KEY } from '../db/config';
 import { sendChannelMessage, createButtonComponents } from '../discord/rest';
-import { recruitNotificationNow } from '../cron/dailyCheck';
-import { formatTimeRange } from '../lib/date';
+import { recruitNotificationNow, sendRecruitment } from '../cron/dailyCheck';
+import { formatDate, formatTimeRange, getJSTNow } from '../lib/date';
 import { getSetupStatus, registerCommandsForEnv } from './setup';
 
 function json(body: unknown, status = 200): Response {
@@ -280,10 +283,13 @@ function toNotificationInput(b: Record<string, unknown>): NotificationInput | nu
  * - GET/POST   /notifications[?guild_id=],    GET/PUT/DELETE /notifications/:id
  *              （POST/PUT で type='oneoff' は body.candidate_dates[] を候補回として同期）
  * - GET        /notifications/:id/occurrences
+ * - POST       /notifications/:id/occurrences ({date,start_time?,status?} 日付指定で実体化・中止墓石/臨時回)
+ * - GET        /notifications/:id/plan        (未実体化の未来開催日を RRULE から導出)
  * - POST       /notifications/:id/decide      ({occurrence_id} 最終確定・他候補を cancel)
  * - POST       /notifications/:id/undecide    (確定解除・落選候補を復活)
  * - POST       /notifications/:id/recruit     (今すぐ募集を投稿)
  * - PUT        /occurrences/:id               ({status|date})
+ * - POST       /occurrences/:id/recruit       (単一開催回の即時募集・send_log 記録つき)
  * - GET        /occurrences/:id/responses,    GET /occurrences/:id/status (集計バケット)
  * - GET        /responses?limit=
  * - GET        /send-log[?notification_id=&limit=]   (リマインド送信履歴・④可視化)
@@ -499,7 +505,10 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
           await syncCandidateOccurrences(db, created.id, slots);
           return json(created, 201);
         }
-        return json(await createNotification(db, input), 201);
+        const created = await createNotification(db, input);
+        // 次ティックの日次ロールフォワードで次回開催回を即時実体化させる（rrule 実体化は 1 日 1 回集約）。
+        await setConfig(db, OCC_ROLLFORWARD_KEY, '');
+        return json(created, 201);
       }
     }
     // /notifications/:uuid/occurrences
@@ -509,6 +518,46 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
       if (!n) return json({ error: 'Not found' }, 404);
       const limit = parseLimit(url.searchParams.get('limit'), 100);
       return json(await listOccurrencesForNotification(db, n.id, limit));
+    }
+    // 開催回を日付指定で実体化する（配信予定の「配信しない」＝ cancelled で作成、臨時回=scheduled）。
+    // UNIQUE(notification_id, date, start_time) 上の upsert なので二重作成しない。
+    if (notifOccs && method === 'POST') {
+      const n = await getNotificationByUuid(db, notifOccs[1]);
+      if (!n) return json({ error: 'Not found' }, 404);
+      const b = (await request.json()) as {
+        date?: string;
+        start_time?: string;
+        status?: string;
+        note?: string;
+      };
+      if (typeof b.date !== 'string' || !/^\d{4}\/\d{2}\/\d{2}$/.test(b.date)) {
+        return json({ error: 'date (YYYY/MM/DD) required' }, 400);
+      }
+      const status = b.status ?? 'scheduled';
+      if (status !== 'scheduled' && status !== 'cancelled') {
+        return json({ error: 'invalid status' }, 400);
+      }
+      const time = typeof b.start_time === 'string' ? b.start_time : n.start_time;
+      // 補足メッセージ（任意）。空白のみは「なし」に正規化し、message_body と同様に上限を切る。
+      const note = typeof b.note === 'string' && b.note.trim() ? b.note.trim().slice(0, 500) : null;
+      const occ = await getOrCreateOccurrence(db, n.id, b.date, time);
+      if (occ.status !== status) await setOccurrenceStatus(db, occ.id, status);
+      if (note !== null) await setOccurrenceNote(db, occ.id, note);
+      return json({ ...occ, status, note: note ?? occ.note }, 201);
+    }
+    // 配信予定（未実体化の未来開催日）。RRULE から導出し、既に開催回が実体化済みの日付は除く。
+    const notifPlan = path.match(new RegExp(`^/notifications/(${UUID_RE})/plan$`));
+    if (notifPlan && method === 'GET') {
+      const n = await getNotificationByUuid(db, notifPlan[1]);
+      if (!n) return json({ error: 'Not found' }, 404);
+      if (n.type !== 'recurring') return json([]);
+      const count = parseLimit(url.searchParams.get('count'), 8);
+      const dates = nextOccurrenceDates(n, count);
+      const existing = await listOccurrencesForNotification(db, n.id, 200);
+      const taken = new Set(existing.map((o) => o.occurrence_date));
+      return json(
+        dates.filter((d) => !taken.has(d)).map((d) => ({ occurrence_date: d, start_time: n.start_time })),
+      );
     }
     // /notifications/:uuid/decide （複数候補日の最終確定）
     const notifDecide = path.match(new RegExp(`^/notifications/(${UUID_RE})/decide$`));
@@ -580,6 +629,8 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
           return json({ ok });
         }
         const ok = await updateNotification(db, n.id, input);
+        // rrule/anchor/start_time 変更で次回日が変わりうるため実体化をやり直させる。
+        if (ok) await setConfig(db, OCC_ROLLFORWARD_KEY, '');
         return json({ ok }, ok ? 200 : 404);
       }
       if (method === 'DELETE') {
@@ -604,6 +655,34 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
       const n = await getNotification(db, occ.notification_id);
       if (!n) return json({ error: 'Not found' }, 404);
       return json(await getStatusBuckets(db, occ.id, n.segment_id));
+    }
+    // /occurrences/:uuid/recruit （単一開催回の即時募集・臨時回向け）
+    // send_log に claim/finish を記録し、cron の窓内自動募集（hasSentKind 照合）と二重にならないようにする。
+    const occRecruit = path.match(new RegExp(`^/occurrences/(${UUID_RE})/recruit$`));
+    if (occRecruit && method === 'POST') {
+      const occ = await getOccurrenceByUuid(db, occRecruit[1]);
+      if (!occ) return json({ error: 'Not found' }, 404);
+      if (occ.status !== 'scheduled') return json({ error: '中止された開催回は募集できません。' }, 400);
+      const n = await getNotification(db, occ.notification_id);
+      if (!n) return json({ error: 'Not found' }, 404);
+      const key = {
+        notification_id: n.id,
+        occurrence_id: occ.id,
+        kind: 'recruit' as const,
+        send_date: formatDate(getJSTNow()),
+      };
+      // body は任意（{force?: true}）。force=送信済みでも再送する（UI の確認ダイアログ了承後のみ）。
+      const b = (await request.json().catch(() => ({}))) as { force?: boolean };
+      // 新規 claim できなければ、失敗で終わった同日 claim を取り直す（当日中の手動リトライを許す）。
+      // force 時は sent も取り直す。sending（送信中）だけはどちらでも不可＝並行実行の二重送信ガード。
+      const claimed =
+        (await claimSend(db, key)) ||
+        (await reclaimFailedSend(db, key)) ||
+        (b.force === true && (await reclaimSentSend(db, key)));
+      if (!claimed) return json({ error: 'この開催回の募集は既に送信済み（または送信中）です。' }, 409);
+      const ok = await sendRecruitment(env, n, occ);
+      await finishSend(db, key, ok, ok ? null : 'manual send failed');
+      return json({ ok }, ok ? 200 : 400);
     }
     // /occurrences/:uuid ({status|date})
     const occId = path.match(new RegExp(`^/occurrences/(${UUID_RE})$`));

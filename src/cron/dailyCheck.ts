@@ -5,6 +5,8 @@ import { listActiveNotifications } from '../db/notifications';
 import {
   getOccurrence,
   getOrCreateOccurrence,
+  hasCancelledOccurrenceOnDate,
+  listFutureOccurrencesAll,
   listScheduledOccurrences,
 } from '../db/occurrences';
 import {
@@ -13,8 +15,15 @@ import {
   remainingUndecidedTargets,
 } from '../db/responses';
 import { getActiveSegmentMembers, getSegment, listSegments } from '../db/segments';
-import { claimSend, finishSend, clearStaleClaims, type SendKey } from '../db/sendLog';
-import { getSendBudget, getConfig, setConfig } from '../db/config';
+import { claimSend, finishSend, clearStaleClaims, hasSentKind, type SendKey } from '../db/sendLog';
+import {
+  getAllConfig,
+  setConfig,
+  parseConfigInt,
+  SEND_BUDGET_KEY,
+  DEFAULT_SEND_BUDGET,
+  OCC_ROLLFORWARD_KEY,
+} from '../db/config';
 import { syncSegmentFromRole } from '../discord/syncSegment';
 import { nextOccurrenceDate } from '../lib/recurrence';
 import {
@@ -32,12 +41,19 @@ import {
   buildMentionPrefix,
   composePost,
   listGuildMembers,
+  listGuilds,
   DISCORD_CONTENT_LIMIT,
   type GuildMemberSummary,
 } from '../discord/rest';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const DM_INTERVAL_MS = 300;
+
+// 日次ロールフォワードで 1 ティックに rrule 評価する recurring の最大件数。
+// rrule は ~1ms/回（dtstart 巻き寄せ後）× Workers Free の CPU 10ms 律速のため、1 ティックに
+// 全件は回せない。kill されても次ティックが同じチャンクから再開する（マーカーで進捗管理）。
+// ponytail: 8件/分＝recurring 数百件で実体化完了に約1時間。その規模は Paid 前提で要再設計。
+const ROLLFORWARD_CHUNK = 8;
 
 /**
  * 投稿の @メンション接頭辞を mention_mode に従って解決する（ADR 0010）。
@@ -97,12 +113,15 @@ function slotLabel(occ: Occurrence, n: Notification): string {
 }
 
 /** 募集（回答締切が設定されていれば日時行に併記する・ADR 0014）。 */
-async function sendRecruitment(env: Env, n: Notification, occ: Occurrence): Promise<boolean> {
+export async function sendRecruitment(env: Env, n: Notification, occ: Occurrence): Promise<boolean> {
   const segment = await getSegment(env.DB, n.segment_id);
   const dl = responseDeadline(occ.occurrence_date, slotTime(occ, n), n.response_deadline_hours);
-  const tail = dl
+  const dateLine = dl
     ? `日時: **${slotLabel(occ, n)}**\n回答締切: **${formatDate(dl)} ${String(dl.getHours()).padStart(2, '0')}:${String(dl.getMinutes()).padStart(2, '0')}**`
     : `日時: **${slotLabel(occ, n)}**`;
+  // 開催回の補足メッセージ（臨時回のコラボ説明など）は本文と日時行の間に差し込む。
+  // tail に含めることで composeChannelPost の字数バジェットに自動で乗る。
+  const tail = occ.note?.trim() ? `${occ.note.trim()}\n\n${dateLine}` : dateLine;
   // 見出し（必須）＋本文（任意）＋日時行（自動）。回答不要(announce-only)はボタンを付けない。
   const message = await composeChannelPost(env, n, segment, tail);
   const components = isAnnounceOnly(n) ? null : createButtonComponents(occ.id, n.type);
@@ -199,10 +218,11 @@ export async function recruitNotificationNow(
   if (!target) {
     return { ok: false, message: '次回の開催日を特定できませんでした（rrule を確認してください）。' };
   }
-  const occ = await getOrCreateOccurrence(db, n.id, target, n.start_time);
-  if (occ.status === 'cancelled') {
+  // 中止の墓石照合は日付のみ（時刻無視）。start_time 変更後も中止意図を維持する。
+  if (await hasCancelledOccurrenceOnDate(db, n.id, target)) {
     return { ok: false, message: `**${target}** の開催回は中止扱いのため募集できません。` };
   }
+  const occ = await getOrCreateOccurrence(db, n.id, target, n.start_time);
   const recurOk = await sendRecruitment(env, n, occ);
   return recurOk
     ? { ok: true, message: `**${formatOccurrenceLabel(occ.occurrence_date, slotTime(occ, n), n.duration_minutes)}** の募集メッセージを送信しました!` }
@@ -216,11 +236,18 @@ export async function recruitNotificationNow(
 //   毎分実行でも二重送信しない。subrequest 50/実行（Free）律速に対し予算で構造的に超えない。
 // =============================================================================
 
+/**
+ * DM 見出しへのサーバー名付記。同じ Bot を複数サーバーで使うと同一メンバーへの DM が
+ * 1 つのスレッドに混在してどのサーバーのイベントか判別できないため、見出しに付ける。
+ * 名前未解決（同期前・不参加 guild）は付記を省略して従来表示に落とす。
+ */
+const guildSuffix = (guildName: string) => (guildName ? `（${guildName}）` : '');
+
 /** ノルマ DM 文面 */
-function quotaMessage(n: Notification, member: QuotaAlert): string {
+function quotaMessage(n: Notification, member: QuotaAlert, guildName: string): string {
   const daysText = `${member.daysSinceLast}日前`;
   return (
-    `📊 **参加間隔の確認**\n\n` +
+    `📊 **参加間隔の確認**${guildSuffix(guildName)}\n\n` +
     `こんにちは、**${resolveDisplayName(member)}** さん！\n` +
     `前回のイベント参加から少し時間が空いているようです（目安: ${n.quota_interval_days}日に1回）。\n\n` +
     `- 最終参加: **${member.lastDateStr}** (${daysText})\n\n` +
@@ -229,19 +256,19 @@ function quotaMessage(n: Notification, member: QuotaAlert): string {
 }
 
 /** 未回答リマインド DM 文面 */
-function unansweredMessage(n: Notification, occ: Occurrence, daysUntil: number): string {
+function unansweredMessage(n: Notification, occ: Occurrence, daysUntil: number, guildName: string): string {
   const dayText = daysUntil === 0 ? '今日' : `あと${daysUntil}日`;
   return (
-    `⏰ **リマインド: ${dayText}のイベント**\n\n` +
+    `⏰ **リマインド: ${dayText}のイベント**${guildSuffix(guildName)}\n\n` +
     `日時: **${slotLabel(occ, n)}**\n\n` +
     `まだ回答されていません。下のボタンで参加状況を回答してください!`
   );
 }
 
 /** 未定者リマインド DM 文面 */
-function undecidedMessage(n: Notification, occ: Occurrence): string {
+function undecidedMessage(n: Notification, occ: Occurrence, guildName: string): string {
   return (
-    `❓ **未定者へのリマインド**\n\n` +
+    `❓ **未定者へのリマインド**${guildSuffix(guildName)}\n\n` +
     `日時: **${slotLabel(occ, n)}**\n\n` +
     `現在「未定」で回答されています。下のボタンで参加/不参加を確定してください!`
   );
@@ -262,6 +289,7 @@ interface TickCtx {
   today: string; // 'YYYY/MM/DD'(JST)
   hour: number; // JST 時(0-23)
   budget: { n: number }; // 1 ティックの残り送信予算（subrequest 50 律速）
+  config: Record<string, string>; // ティック冒頭で一括読みした config（毎分の細切れ照会を避ける）
 }
 
 interface SendTask {
@@ -297,7 +325,8 @@ async function drainTasks(ctx: TickCtx, tasks: SendTask[]): Promise<void> {
  */
 async function ensureRoleSync(ctx: TickCtx, guildId: string): Promise<void> {
   const markerKey = `rolesync:${guildId}`;
-  if ((await getConfig(ctx.db, markerKey)) === ctx.today) return;
+  // マーカーはティック冒頭の config スナップショットで判定（開催回ごとに呼ばれても照会を打たない）。
+  if (ctx.config[markerKey] === ctx.today) return;
   let members: GuildMemberSummary[];
   try {
     members = await listGuildMembers(ctx.env, guildId);
@@ -316,8 +345,38 @@ async function ensureRoleSync(ctx: TickCtx, guildId: string): Promise<void> {
     }
   }
   await setConfig(ctx.db, markerKey, ctx.today);
+  ctx.config[markerKey] = ctx.today; // 同ティック内の後続呼び出しもスキップさせる
   // メンバー取得（ページング）の subrequest を保守的に予算から控除（大規模は Paid 前提）。
   ctx.budget.n = Math.max(0, ctx.budget.n - 5);
+}
+
+/**
+ * DM 付記用のサーバー名を解決する（1 日 1 回 listGuilds → config 永続化・rolesync と同型）。
+ * 毎ティック Discord API を叩かないよう、名前一覧は config の 1 キーに日付付き JSON で持ち、
+ * 日付が変わった最初の DM 送信時だけ再同期する。取得失敗時は前回同期の名前を使い続ける
+ * （day 未更新のため次ティックで自然リトライ）。未解決の guild は '' を返す。
+ */
+export const GUILD_NAMES_KEY = 'guild_names';
+export async function resolveGuildName(ctx: TickCtx, guildId: string): Promise<string> {
+  let cached: { day?: string; names?: Record<string, string> } = {};
+  try {
+    cached = JSON.parse(ctx.config[GUILD_NAMES_KEY] || '{}');
+  } catch {}
+  if (cached.day !== ctx.today) {
+    try {
+      const guilds = await listGuilds(ctx.env);
+      const names: Record<string, string> = {};
+      for (const g of guilds) names[g.id] = g.name;
+      cached = { day: ctx.today, names };
+      const json = JSON.stringify(cached);
+      await setConfig(ctx.db, GUILD_NAMES_KEY, json);
+      ctx.config[GUILD_NAMES_KEY] = json; // 同ティック内の後続解決はスナップショットから読む
+      ctx.budget.n = Math.max(0, ctx.budget.n - 1); // listGuilds の subrequest を予算から控除
+    } catch (e) {
+      console.error(`[GuildNames] fetch failed: ${(e as Error).message}`);
+    }
+  }
+  return cached.names?.[guildId] || '';
 }
 
 /** 開催回の回答締切が到来しているか（ADR 0014）。 */
@@ -340,16 +399,58 @@ export function deadlineNoticeKey(n: Notification, occ: Occurrence): SendKey {
   };
 }
 
-/** 1 通知の「今日の未送信分」をペース配信で処理する（recurring / oneoff 共通）。 */
-async function drainNotification(ctx: TickCtx, n: Notification): Promise<void> {
-  const { env, db, today, hour } = ctx;
+/**
+ * 通知が daysUntil 日後の開催回に対して何か送りうるか（安価な事前判定）。
+ * recurring の実体化判定と開催回ループの cheap-skip に使う（毎分実行の負荷を抑える）。
+ * 募集は窓の途中で作られた臨時回にも出すため範囲判定（0..recruit_days_before）。
+ */
+export function inSendWindow(n: Notification, daysUntil: number): boolean {
+  if (daysUntil < 0) return false;
   const announceOnly = isAnnounceOnly(n);
+  const inRecruit = daysUntil <= n.recruit_days_before;
+  const inUnanswered = !announceOnly && daysUntil <= n.remind_start_days;
+  const inUndecided = !announceOnly && daysUntil === n.remind_undecided_days;
+  const mayDeadline =
+    !announceOnly && n.response_deadline_hours != null && daysUntil <= n.recruit_days_before;
+  return inRecruit || inUnanswered || inUndecided || mayDeadline;
+}
 
-  // --- 対象開催回を決める ---
-  let occ: Occurrence | null = null;
-  let daysUntil = 0;
+/**
+ * 日次ロールフォワードの今ティックの処理範囲を決める（pure・マーカー形式の単一の解釈点）。
+ * マーカー: 'YYYY/MM/DD'＝その日は完了 / 'YYYY/MM/DD:N'＝進行中（次は index N から）/
+ * それ以外（別日・''・未設定）＝先頭から。完了済みなら null、未了なら [start,end) と
+ * 処理後に書き戻す次マーカー（末尾まで達したら完了形）を返す。
+ */
+export function rollforwardWindow(
+  marker: string | null | undefined,
+  today: string,
+  total: number,
+  chunk: number,
+): { start: number; end: number; next: string } | null {
+  const [day, offset] = (marker ?? '').split(':');
+  if (day === today && offset === undefined) return null; // 今日は完了済み
+  const start = day === today ? Math.max(0, Math.min(Number(offset) || 0, total)) : 0;
+  const end = Math.min(start + chunk, total);
+  return { start, end, next: end >= total ? today : `${today}:${end}` };
+}
+
+/**
+ * 1 通知の「今日の未送信分」をペース配信で処理する。
+ * - oneoff: 従来どおり確定回 or 単一候補のみ対象（複数候補の募集は手動）。
+ * - recurring: 未来の scheduled 開催回（臨時回を含む）を列挙し、RRULE の次回日は
+ *   「その日付に行が 1 つも無い場合のみ」送信窓内で実体化して加える。
+ *   同日付に行があるときは実体化しない: cancelled の墓石は配信停止として働き、
+ *   時刻違いの scheduled 行（中止＋臨時追加による開催し直し）はそのまま対象になる。
+ */
+async function drainNotification(
+  ctx: TickCtx,
+  n: Notification,
+  futureOccs: Occurrence[],
+): Promise<void> {
+  const { db } = ctx;
   if (n.type === 'oneoff') {
     // 単発: 確定回 or 単一候補のみリマインド対象（募集は手動・cron では送らない）。
+    let occ: Occurrence | null = null;
     if (n.decided_occurrence_id != null) {
       const o = await getOccurrence(db, n.decided_occurrence_id);
       occ = o && o.status === 'scheduled' ? o : null;
@@ -360,24 +461,29 @@ async function drainNotification(ctx: TickCtx, n: Notification): Promise<void> {
         occ = await getOrCreateOccurrence(db, n.id, n.one_off_date, n.start_time);
     }
     if (!occ || occ.status !== 'scheduled') return;
-    daysUntil = getDaysUntil(occ.occurrence_date);
-  } else {
-    const date = nextOccurrenceDate(n);
-    if (!date) return;
-    daysUntil = getDaysUntil(date);
-    // 今日が「送信のありうる日」でなければ開催回も作らず安価に skip（毎分実行の負荷を抑える）。
-    const inRecruit = daysUntil === n.recruit_days_before;
-    const inUnanswered = !announceOnly && daysUntil >= 0 && daysUntil <= n.remind_start_days;
-    const inUndecided = !announceOnly && daysUntil === n.remind_undecided_days;
-    const mayDeadline =
-      !announceOnly &&
-      n.response_deadline_hours != null &&
-      daysUntil >= 0 &&
-      daysUntil <= n.recruit_days_before;
-    if (!inRecruit && !inUnanswered && !inUndecided && !mayDeadline) return;
-    occ = await getOrCreateOccurrence(db, n.id, date, n.start_time);
-    if (occ.status === 'cancelled') return;
+    await drainOccurrence(ctx, n, occ);
+    return;
   }
+
+  // recurring: 対象開催回の列挙。次回開催回の実体化は mainDailyCheck の日次ロールフォワードで
+  // 済ませてある（rrule 評価が重く毎ティック走らせられないため）。ここは実体化済みの行を処理する。
+  const targets = futureOccs.filter((o) => o.status === 'scheduled');
+  // 直近の回を優先して予算を使う（日付・時刻昇順）
+  targets.sort((a, b) =>
+    (a.occurrence_date + (a.start_time || '')).localeCompare(b.occurrence_date + (b.start_time || '')),
+  );
+  for (const occ of targets) {
+    if (ctx.budget.n <= 0) return;
+    if (!inSendWindow(n, getDaysUntil(occ.occurrence_date))) continue;
+    await drainOccurrence(ctx, n, occ);
+  }
+}
+
+/** 1 開催回の「今日の未送信分」をペース配信で処理する（recurring / oneoff 共通の送信本体）。 */
+async function drainOccurrence(ctx: TickCtx, n: Notification, occ: Occurrence): Promise<void> {
+  const { env, db, today, hour } = ctx;
+  const announceOnly = isAnnounceOnly(n);
+  const daysUntil = getDaysUntil(occ.occurrence_date);
 
   // --- (1) 締切告知（メンバー向け・締切時刻ゲート。send_hour に依存せず時刻ベースで独立発火・ADR 0014）---
   // 文面は固定（@メンションなし）だが、念のため allowed_mentions={parse:[]} で一切ピングしないことを保証。
@@ -385,7 +491,7 @@ async function drainNotification(ctx: TickCtx, n: Notification): Promise<void> {
     await drainTasks(ctx, [
       {
         key: deadlineNoticeKey(n, occ),
-        run: () => sendChannelMessage(env, n.channel_id, deadlineNoticeMessage(n, occ!), null, { parse: [] }),
+        run: () => sendChannelMessage(env, n.channel_id, deadlineNoticeMessage(n, occ), null, { parse: [] }),
       },
     ]);
   }
@@ -397,12 +503,19 @@ async function drainNotification(ctx: TickCtx, n: Notification): Promise<void> {
   // announce-only のみのギルドでもロール管理区分が同期されるよう、announce-only 判定の前に呼ぶ。
   await ensureRoleSync(ctx, n.guild_id);
 
-  // --- (2) 募集（recruit_days_before 当日・チャンネル投稿）---
-  if (daysUntil === n.recruit_days_before) {
+  // --- (2) 募集（チャンネル投稿）---
+  // recurring は窓判定（0..recruit_days_before）＋「開催回につき 1 回」（hasSentKind・send_date 無視）。
+  // 窓の途中で作られた臨時回にも募集が出る。送信失敗（failed）は翌日以降に自然リトライされる。
+  // oneoff は従来どおり当日一致のみ（複数候補の募集は手動運用）。
+  const wantRecruit =
+    n.type === 'recurring'
+      ? daysUntil <= n.recruit_days_before && !(await hasSentKind(db, n.id, occ.id, 'recruit'))
+      : daysUntil === n.recruit_days_before;
+  if (wantRecruit) {
     await drainTasks(ctx, [
       {
         key: { notification_id: n.id, occurrence_id: occ.id, kind: 'recruit', send_date: today },
-        run: () => sendRecruitment(env, n, occ!),
+        run: () => sendRecruitment(env, n, occ),
       },
     ]);
   }
@@ -412,11 +525,12 @@ async function drainNotification(ctx: TickCtx, n: Notification): Promise<void> {
   // --- (3) ノルマ（recruit 当日・未送信分のみ）---
   if (n.quota_enabled && n.quota_interval_days && daysUntil === n.recruit_days_before && ctx.budget.n > 0) {
     const alerts = await checkQuotaForNotification(db, n);
+    const guildName = await resolveGuildName(ctx, n.guild_id);
     await drainTasks(
       ctx,
       alerts.map((member) => ({
         key: { notification_id: n.id, user_id: member.user_id, kind: 'quota' as const, send_date: today },
-        run: () => sendDirectMessageCached(env, db, member, quotaMessage(n, member)),
+        run: () => sendDirectMessageCached(env, db, member, quotaMessage(n, member, guildName)),
       })),
     );
   }
@@ -430,11 +544,12 @@ async function drainNotification(ctx: TickCtx, n: Notification): Promise<void> {
     }
     if (proceed) {
       const targets = await remainingUnansweredTargets(db, n.segment_id, occ.id, n.id, today, ctx.budget.n);
+      const guildName = await resolveGuildName(ctx, n.guild_id);
       await drainTasks(
         ctx,
         targets.map((member) => ({
-          key: { notification_id: n.id, occurrence_id: occ!.id, user_id: member.user_id, kind: 'remind_unanswered' as const, send_date: today },
-          run: () => sendDirectMessageCached(env, db, member, unansweredMessage(n, occ!, daysUntil), createButtonComponents(occ!.id, n.type)),
+          key: { notification_id: n.id, occurrence_id: occ.id, user_id: member.user_id, kind: 'remind_unanswered' as const, send_date: today },
+          run: () => sendDirectMessageCached(env, db, member, unansweredMessage(n, occ, daysUntil, guildName), createButtonComponents(occ.id, n.type)),
         })),
       );
     }
@@ -443,11 +558,12 @@ async function drainNotification(ctx: TickCtx, n: Notification): Promise<void> {
   // --- (5) 未定リマインド（daysUntil===remind_undecided_days）---
   if (daysUntil === n.remind_undecided_days && ctx.budget.n > 0) {
     const targets = await remainingUndecidedTargets(db, n.segment_id, occ.id, n.id, today, ctx.budget.n);
+    const guildName = await resolveGuildName(ctx, n.guild_id);
     await drainTasks(
       ctx,
       targets.map((member) => ({
-        key: { notification_id: n.id, occurrence_id: occ!.id, user_id: member.user_id, kind: 'remind_undecided' as const, send_date: today },
-        run: () => sendDirectMessageCached(env, db, member, undecidedMessage(n, occ!), createButtonComponents(occ!.id, n.type)),
+        key: { notification_id: n.id, occurrence_id: occ.id, user_id: member.user_id, kind: 'remind_undecided' as const, send_date: today },
+        run: () => sendDirectMessageCached(env, db, member, undecidedMessage(n, occ, guildName), createButtonComponents(occ.id, n.type)),
       })),
     );
   }
@@ -459,19 +575,62 @@ async function drainNotification(ctx: TickCtx, n: Notification): Promise<void> {
  */
 export async function mainDailyCheck(env: Env): Promise<void> {
   const now = getJSTNow();
+  // config（数行の key/value）はティック冒頭に一括読みし、送信予算・ロールフォワード・
+  // ロール同期マーカーの細切れ照会を 1 クエリに畳む。
+  const config = await getAllConfig(env.DB);
   const ctx: TickCtx = {
     env,
     db: env.DB,
     now,
     today: formatDate(now),
     hour: now.getHours(),
-    budget: { n: await getSendBudget(env.DB) },
+    budget: { n: parseConfigInt(config[SEND_BUDGET_KEY], DEFAULT_SEND_BUDGET) },
+    config,
   };
-  // クラッシュ等で status='sending' のまま残った claim を回収（5分以上前）→ 次ティックで再送可能にする。
-  await clearStaleClaims(env.DB, new Date(Date.now() - 5 * 60_000).toISOString());
+  // クラッシュ等で status='sending' のまま残った claim を回収（5分以上前）→ 再送可能にする。
+  // 回収対象がそもそも「5分以上前」なので回収も 5 分粒度で足りる（毎分 DELETE を打たない）。
+  if (now.getMinutes() % 5 === 0) {
+    await clearStaleClaims(env.DB, new Date(Date.now() - 5 * 60_000).toISOString());
+  }
 
   const notifications = await listActiveNotifications(env.DB);
   if (notifications.length === 0) return;
+
+  // 未来の開催回（臨時回・中止の墓石を含む）を 1 クエリで一括取得して通知ごとに配る。
+  // 通知ごとの個別照会を避け、毎分実行のクエリ数を通知数に比例させない。
+  const futureByNotif = new Map<number, Occurrence[]>();
+  for (const o of await listFutureOccurrencesAll(env.DB, ctx.today)) {
+    const arr = futureByNotif.get(o.notification_id);
+    if (arr) arr.push(o);
+    else futureByNotif.set(o.notification_id, [o]);
+  }
+
+  // 日次ロールフォワード: recurring の次回開催回を rrule から実体化する（1 日 1 巡）。
+  // rrule 評価は重く毎ティック全件は回せないため、1 ティック最大 ROLLFORWARD_CHUNK 件ずつ
+  // 進め、マーカーに進捗を持たせる（kill・transient 失敗でも次ティックが続きから再開＝
+  // 「マーカー未達で毎ティック全量リトライ→恒常超過」のスパイラルを構造的に防ぐ）。
+  // 完了後のティックは実体化済み行を futureByNotif 経由で読むだけ＝rrule 評価ゼロ。
+  // 通知の作成/編集時は admin 側がマーカーを '' にクリアし、次ティックから先頭をやり直す。
+  const recurrings = notifications.filter((n) => n.type === 'recurring');
+  const rf = rollforwardWindow(ctx.config[OCC_ROLLFORWARD_KEY], ctx.today, recurrings.length, ROLLFORWARD_CHUNK);
+  if (rf) {
+    recurrings.sort((a, b) => a.id - b.id); // チャンクの跨ティック整合のため順序を固定
+    for (const n of recurrings.slice(rf.start, rf.end)) {
+      try {
+        const existing = futureByNotif.get(n.id) ?? [];
+        const ruleDate = nextOccurrenceDate(n);
+        // 同日付に行がある（scheduled でも cancelled の墓石でも）場合は実体化しない。
+        if (ruleDate && !existing.some((o) => o.occurrence_date === ruleDate) && inSendWindow(n, getDaysUntil(ruleDate))) {
+          existing.push(await getOrCreateOccurrence(env.DB, n.id, ruleDate, n.start_time));
+          futureByNotif.set(n.id, existing); // 同ティックの送信ループでも拾えるよう反映
+        }
+      } catch (e) {
+        // 1 件の失敗（D1 transient 等）で巡回全体を止めない。翌日/マーカークリアで自己回復。
+        console.error(`[Rollforward] n=${n.id} failed: ${(e as Error).message}`);
+      }
+    }
+    await setConfig(env.DB, OCC_ROLLFORWARD_KEY, rf.next);
+  }
 
   // 予算切れ時の公平性: ティック番号で開始位置をローテートし、特定通知の優先固定を避ける
   //（通知数 > 60 でも全件が順に先頭へ回る）。
@@ -481,7 +640,7 @@ export async function mainDailyCheck(env: Env): Promise<void> {
   for (const n of ordered) {
     if (ctx.budget.n <= 0) break;
     try {
-      await drainNotification(ctx, n);
+      await drainNotification(ctx, n, futureByNotif.get(n.id) ?? []);
     } catch (e) {
       console.error(`[Tick] n=${n.id} failed: ${(e as Error).message}`);
     }

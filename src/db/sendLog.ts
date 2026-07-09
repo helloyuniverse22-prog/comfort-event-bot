@@ -63,6 +63,40 @@ export async function finishSend(
 }
 
 /**
+ * failed で終わった claim を sending に戻して再取得する（手動再送用）。
+ * 同日 UNIQUE 鍵に failed 行が残ると claimSend が弾いて当日中の再送ができないため、
+ * 管理画面の「今すぐ募集」はこれで失敗分を明示的に取り直す（sending/sent は対象外＝二重送信防止は維持）。
+ */
+export async function reclaimFailedSend(db: D1Database, k: SendKey): Promise<boolean> {
+  return reclaimSend(db, k, 'failed');
+}
+
+/**
+ * sent で終わった claim を sending に戻して再取得する（手動の強制再送用）。
+ * Discord 上で投稿を削除した後の再送は Bot 側から削除を検知できないため、
+ * 管理画面の確認ダイアログ了承（force）に限って使う。sending は対象外＝並行実行ガードは維持。
+ */
+export async function reclaimSentSend(db: D1Database, k: SendKey): Promise<boolean> {
+  return reclaimSend(db, k, 'sent');
+}
+
+async function reclaimSend(
+  db: D1Database,
+  k: SendKey,
+  status: 'failed' | 'sent',
+): Promise<boolean> {
+  const res = await db
+    .prepare(
+      `UPDATE send_log SET status = 'sending', error = NULL
+         WHERE notification_id = ? AND occurrence_id = ? AND user_id = ? AND kind = ? AND send_date = ?
+           AND status = ?`,
+    )
+    .bind(k.notification_id, k.occurrence_id ?? 0, k.user_id ?? '', k.kind, k.send_date, status)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+/**
  * クラッシュ等で status='sending' のまま残った claim を回収する（ADR 0013）。
  * 指定時刻より前の 'sending' 行を削除し、次ティックで再送できるようにする（毎ティック先頭で呼ぶ）。
  */
@@ -71,6 +105,28 @@ export async function clearStaleClaims(db: D1Database, olderThanIso: string): Pr
     .prepare("DELETE FROM send_log WHERE status = 'sending' AND created_at < ?")
     .bind(olderThanIso)
     .run();
+}
+
+/**
+ * その開催回にこの種別のチャンネル送信が済んでいるか（send_date は無視・failed は数えない）。
+ * 「開催回につき 1 回」の送信（募集など）の跨日デデュープに使う。send_date を無視するため、
+ * 旧キー（send_date=実行日）で記録済みの行にもヒットし、キー運用の変更を跨いでも二重送信しない。
+ */
+export async function hasSentKind(
+  db: D1Database,
+  notificationId: number,
+  occurrenceId: number,
+  kind: SendLogKind,
+): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT 1 FROM send_log
+        WHERE notification_id = ? AND occurrence_id = ? AND user_id = '' AND kind = ?
+          AND status IN ('sending', 'sent') LIMIT 1`,
+    )
+    .bind(notificationId, occurrenceId, kind)
+    .first();
+  return row != null;
 }
 
 /** 指定キーが既に存在するか（claim 済み／送信済み）。テスト・推定用の読み取りヘルパ。 */

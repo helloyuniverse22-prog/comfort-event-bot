@@ -123,20 +123,33 @@ export function composePost(
   return msg;
 }
 
+/** 保存値（参加/不参加/未定・null=未回答）を「絵文字＋表示ラベル」に変換する。 */
+function answerEmojiLabel(status: string | null, L: AnswerLabels): string {
+  if (status === '参加') return `⭕ ${L.participate}`;
+  if (status === '不参加') return `❌ ${L.absent}`;
+  if (status === '未定') return `❓ ${L.undecided}`;
+  return '⚠️ 未回答';
+}
+
 /**
  * 状況確認メッセージ。title は日付（または 'YYYY/MM/DD (曜) HH:MM〜' 等の表示ラベル）。
  * type で見出し・回答ラベルを切替（oneoff=調整状況・可/不可/未確定）。集計バケットのキー自体は不変。
+ * myAnswer を渡すと（null=未回答含む）先頭に「あなたの回答」行を出す。undefined なら省略（従来表示）。
+ * 名前一覧は subtext（-#）で小さく表示し、人数が多いときの視覚ノイズを抑える。
  */
 export function buildStatusMessage(
   title: string,
   s: EventStatusBuckets,
   type: NotificationType = 'recurring',
+  myAnswer?: string | null,
 ): string {
   const L = answerLabels(type);
   const head = type === 'oneoff' ? '調整状況' : '参加状況';
-  const fmt = (users: string[]) => (users.length > 0 ? users.join(', ') : '(なし)');
+  const fmt = (users: string[]) => `-# ${users.length > 0 ? users.join('、') : '(なし)'}`;
+  const mine = myAnswer === undefined ? '' : `👤 あなたの回答: **${answerEmojiLabel(myAnswer, L)}**\n\n`;
   return (
     `📅 **${title} の${head}**\n\n` +
+    mine +
     `⭕ **${L.participate} (${s.参加.length}名)**\n${fmt(s.参加)}\n\n` +
     `❌ **${L.absent} (${s.不参加.length}名)**\n${fmt(s.不参加)}\n\n` +
     `❓ **${L.undecided} (${s.未定.length}名)**\n${fmt(s.未定)}\n\n` +
@@ -147,10 +160,11 @@ export function buildStatusMessage(
 /**
  * 単発の複数候補の状況を 1 メッセージにまとめる（statusall ボタン用）。
  * Discord のメッセージ上限(2000字)に収まるよう、超えそうなら残りを「…ほか N 件」に要約する。
+ * 行に mine があれば（null=未回答含む）候補ごとの自分の回答を末尾に付ける。
  */
 export function buildAllStatusMessage(
   notificationName: string,
-  rows: { label: string; buckets: EventStatusBuckets }[],
+  rows: { label: string; buckets: EventStatusBuckets; mine?: string | null }[],
   type: NotificationType = 'recurring',
 ): string {
   const L = answerLabels(type);
@@ -158,10 +172,11 @@ export function buildAllStatusMessage(
   let msg = `📊 **${notificationName} の候補別 状況**\n`;
   let shown = 0;
   for (const r of rows) {
+    const mine = r.mine === undefined ? '' : ` ｜ 👤 あなた: ${answerEmojiLabel(r.mine, L)}`;
     const line =
       `\n🗓️ **${r.label}**\n` +
       `　${L.participate} ${r.buckets.参加.length} / ${L.absent} ${r.buckets.不参加.length} / ` +
-      `${L.undecided} ${r.buckets.未定.length} / 未回答 ${r.buckets.未回答.length}`;
+      `${L.undecided} ${r.buckets.未定.length} / 未回答 ${r.buckets.未回答.length}${mine}`;
     // 最低 1 件は必ず出す。以降は上限を超える行が来たら残数を要約して打ち切る。
     if (shown > 0 && msg.length + line.length > MAX) {
       msg += `\n\n…ほか ${rows.length - shown} 件（長いため省略）`;

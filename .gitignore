@@ -21,6 +21,8 @@ Thumbs.db
 # Cloudflare / Wrangler
 .wrangler/
 .dev.vars
+.dev.vars.staging
+.claude/settings.local.json
 dist/
 *.tsbuildinfo
 

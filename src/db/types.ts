@@ -156,6 +156,8 @@ export interface Occurrence {
   /** 'HH:MM'（JST）。このスロットの開始時刻。空文字は通知の start_time で補完して表示 */
   start_time: string;
   status: OccurrenceStatus;
+  /** 補足メッセージ（臨時回のコラボ説明など）。募集の本文と日時行の間に差し込む。NULL=なし */
+  note: string | null;
   created_at: string;
 }
 

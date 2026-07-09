@@ -27,12 +27,23 @@ import { getJSTNow } from './date';
  *   当日でも start_time 前なら当日、start_time 以降なら次の回（旧 getTargetDate の当日ロジックを踏襲）。
  */
 export function nextOccurrenceDate(n: Notification, now: Date = getJSTNow()): string | null {
+  const dates = nextOccurrenceDates(n, 1, now);
+  return dates[0] ?? null;
+}
+
+/**
+ * Notification の未来の開催日を最大 count 件、'YYYY/MM/DD'（JST）昇順で返す。
+ * 判定ロジックは nextOccurrenceDate と同一（当日ロジック・anchor パリティ含む）。
+ * oneoff は one_off_date の 1 件のみ。評価不能は空配列。
+ * 配信予定の仮想表示（例外だけ実体化する運用）に使う。
+ */
+export function nextOccurrenceDates(n: Notification, count: number, now: Date = getJSTNow()): string[] {
   if (n.type === 'oneoff') {
-    return n.one_off_date ?? null;
+    return n.one_off_date ? [n.one_off_date] : [];
   }
 
   // recurring: rrule が無ければ評価不能
-  if (!n.rrule) return null;
+  if (!n.rrule) return [];
 
   // rrule は内部を常に UTC で評価する。そこで「JST 壁時計のカレンダー値」を UTC フィールドに
   // 載せた Date を渡し、結果も getUTC* で読む。これでランタイムの TZ（本番=UTC / ローカルテスト=
@@ -51,33 +62,36 @@ export function nextOccurrenceDate(n: Notification, now: Date = getJSTNow()): st
   let rule: RRule;
   try {
     const opts = RRule.parseString(n.rrule);
-    if (opts.freq === undefined) return null; // FREQ 無し = 不正な RRULE
+    if (opts.freq === undefined) return []; // FREQ 無し = 不正な RRULE
     // dtstart（系列の基準）を明示する。無いと rrule は実行時刻を既定起点にし、渡した now を
     // 反映できない。隔週(INTERVAL=2)は dtstart のパリティで開催週が決まるため基準固定が必須。
     //   anchor_date があればそれ、無ければ固定エポック（週次/毎月第N曜は基準非依存）。
     const dtstart = anchorToUTC(n.anchor_date);
     // dtstart が境界より未来だと、その手前の開催回が生成されず近日の回をスキップしてしまう。
-    // 週次/隔週のパリティ（14日周期）を保ったまま境界以前へ巻き戻す（毎月第N曜は基準非依存で無害）。
-    const ahead = dtstart.getTime() - boundary.getTime();
-    if (ahead > 0) {
-      const periods = Math.ceil(ahead / (14 * 86_400_000));
-      dtstart.setUTCDate(dtstart.getUTCDate() - periods * 14);
-    }
+    // 逆に遠い過去だと rrule.after() が dtstart から全開催回を列挙して CPU を食う
+    // （既定エポックの週次で約3.4ms/回 × 毎分 × 通知数 = Workers Free の CPU 10ms 制限超過の主因・2026-07-08）。
+    // どちらも週次/隔週のパリティ（14日周期）を保ったまま境界直前の14日以内へ寄せる（毎月第N曜は基準非依存で無害）。
+    const drift = dtstart.getTime() - boundary.getTime();
+    const periods = Math.ceil(drift / (14 * 86_400_000));
+    if (periods !== 0) dtstart.setUTCDate(dtstart.getUTCDate() - periods * 14);
     opts.dtstart = dtstart;
     rule = new RRule(opts);
   } catch {
-    return null;
+    return [];
   }
 
-  // inc=true: 境界日（0:00）に一致する開催日も含める。
-  const next = rule.after(boundary, true);
-  if (!next) return null;
-
-  // UTC フィールド = JST のカレンダー日付。
-  const y = next.getUTCFullYear();
-  const mo = String(next.getUTCMonth() + 1).padStart(2, '0');
-  const d = String(next.getUTCDate()).padStart(2, '0');
-  return `${y}/${mo}/${d}`;
+  const out: string[] = [];
+  // inc=true: 境界日（0:00）に一致する開催日も含める。2 件目以降は直前の結果から非包含で進める。
+  let cursor: Date | null = rule.after(boundary, true);
+  while (cursor && out.length < count) {
+    // UTC フィールド = JST のカレンダー日付。
+    const y = cursor.getUTCFullYear();
+    const mo = String(cursor.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(cursor.getUTCDate()).padStart(2, '0');
+    out.push(`${y}/${mo}/${d}`);
+    cursor = rule.after(cursor, false);
+  }
+  return out;
 }
 
 /** anchor_date('YYYY/MM/DD') または既定エポックを、UTC フィールドに JST 日付を載せた Date で返す。 */

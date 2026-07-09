@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { nextOccurrenceDate, buildRRule } from '../src/lib/recurrence';
+import { nextOccurrenceDate, nextOccurrenceDates, buildRRule } from '../src/lib/recurrence';
 import type { Notification } from '../src/db/types';
 
 // nextOccurrenceDate は内部で rrule を JST 壁時計で評価する。
@@ -151,6 +151,19 @@ describe('nextOccurrenceDate - anchor_date（隔週パリティ / 未来anchor�
     expect(nextOccurrenceDate(makeNotification({ ...base, anchor_date: '2025/01/11' }), now)).toBe('2025/01/11');
   });
 
+  it('遠い過去の anchor_date は 14 日パリティを保って巻き寄せられる（CPU対策・挙動不変）', () => {
+    const now = new Date(2025, 0, 1, 10, 0); // 1/1 水
+    const base = { type: 'recurring' as const, rrule: 'FREQ=WEEKLY;INTERVAL=2;BYDAY=SA', start_time: '21:00' };
+    // 2025/01/04 から 14 日 × 653 回さかのぼった遠い過去の anchor は同じ隔週系列に属する
+    const far = new Date(2025, 0, 4);
+    far.setDate(far.getDate() - 653 * 14);
+    const farStr = `${far.getFullYear()}/${String(far.getMonth() + 1).padStart(2, '0')}/${String(far.getDate()).padStart(2, '0')}`;
+    expect(nextOccurrenceDate(makeNotification({ ...base, anchor_date: farStr }), now)).toBe(
+      nextOccurrenceDate(makeNotification({ ...base, anchor_date: '2025/01/04' }), now),
+    );
+    expect(nextOccurrenceDate(makeNotification({ ...base, anchor_date: farStr }), now)).toBe('2025/01/04');
+  });
+
   it('未来の anchor_date でも近日の開催回をスキップしない（巻き戻し）', () => {
     const now = new Date(2025, 0, 1, 10, 0); // 1/1 水
     const n = makeNotification({
@@ -233,5 +246,40 @@ describe('buildRRule', () => {
     const n = makeNotification({ type: 'recurring', rrule, start_time: '21:00' });
     const now = new Date(2025, 0, 1, 10, 0); // 水 → 次の土曜
     expect(nextOccurrenceDate(n, now)).toBe('2025/01/04');
+  });
+});
+
+describe('nextOccurrenceDates（複数件の未来開催日・配信予定の仮想導出用）', () => {
+  it('毎週土曜: 連続する土曜日を count 件返す', () => {
+    const n = makeNotification({ rrule: 'FREQ=WEEKLY;BYDAY=SA' });
+    const now = new Date(2025, 0, 1, 12, 0); // 水曜
+    expect(nextOccurrenceDates(n, 3, now)).toEqual(['2025/01/04', '2025/01/11', '2025/01/18']);
+  });
+
+  it('先頭は nextOccurrenceDate と一致する（当日ロジック含め同一）', () => {
+    const n = makeNotification({ rrule: 'FREQ=WEEKLY;BYDAY=SA', start_time: '21:00' });
+    // 土曜当日の start_time 後 → 次週へ進む挙動も一致すること
+    const after = new Date(2025, 0, 4, 22, 0);
+    expect(nextOccurrenceDates(n, 1, after)[0]).toBe(nextOccurrenceDate(n, after));
+    expect(nextOccurrenceDates(n, 1, after)).toEqual(['2025/01/11']);
+  });
+
+  it('隔週: anchor_date のパリティを保って 14 日おきに返す', () => {
+    const n = makeNotification({
+      rrule: 'FREQ=WEEKLY;INTERVAL=2;BYDAY=SA',
+      anchor_date: '2025/01/04',
+    });
+    const now = new Date(2025, 0, 1, 12, 0);
+    expect(nextOccurrenceDates(n, 3, now)).toEqual(['2025/01/04', '2025/01/18', '2025/02/01']);
+  });
+
+  it('oneoff は one_off_date の 1 件のみ（count に関わらず）', () => {
+    const n = makeNotification({ type: 'oneoff', rrule: null, one_off_date: '2025/02/01' });
+    expect(nextOccurrenceDates(n, 5, new Date(2025, 0, 1))).toEqual(['2025/02/01']);
+  });
+
+  it('rrule 無し/不正は空配列', () => {
+    expect(nextOccurrenceDates(makeNotification({ rrule: null }), 3, new Date(2025, 0, 1))).toEqual([]);
+    expect(nextOccurrenceDates(makeNotification({ rrule: 'BYDAY=SA' }), 3, new Date(2025, 0, 1))).toEqual([]);
   });
 });
