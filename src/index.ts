@@ -1,7 +1,7 @@
 import type { Env } from './env';
 import { handleInteraction } from './interactions';
 import { handleAdmin } from './admin';
-import { mainDailyCheck } from './cron/dailyCheck';
+import { runTick } from './cron/tick';
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -21,8 +21,9 @@ export default {
     return env.ASSETS.fetch(request);
   },
 
-  // 日次 cron（wrangler.jsonc の triggers.crons: 0 12 * * * UTC = JST 21:00）
+  // 毎分 cron（wrangler.jsonc の triggers.crons: * * * * *）。送信時刻のゲートと
+  // ペース配信は runTick 側で行う（ADR 0013）。
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(mainDailyCheck(env));
+    ctx.waitUntil(runTick(env));
   },
 } satisfies ExportedHandler<Env>;

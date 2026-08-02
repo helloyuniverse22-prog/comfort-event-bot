@@ -350,6 +350,21 @@ export async function listGuilds(env: Env): Promise<GuildSummary[]> {
   return data.map((g) => ({ id: g.id, name: g.name, icon: g.icon ?? null }));
 }
 
+/**
+ * bot を指定サーバーから退出させる（DELETE /users/@me/guilds/:id）。
+ * ギルド登録したスラッシュコマンドも退出で自動的に消える。既に退出済み（404）は成功扱い。
+ */
+export async function leaveGuild(env: Env, guildId: string): Promise<void> {
+  if (env.MOCK_DISCORD) return;
+  const res = await fetch(`${API}/users/@me/guilds/${guildId}`, {
+    method: 'DELETE',
+    headers: botHeaders(env),
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`Discord leave guild ${res.status}: ${await res.text()}`);
+  }
+}
+
 /** サーバーのテキストチャンネル一覧（GET /guilds/:id/channels・特権インテント不要） */
 export async function listGuildChannels(env: Env, guildId: string): Promise<ChannelSummary[]> {
   if (env.MOCK_DISCORD) return MOCK_CHANNELS;

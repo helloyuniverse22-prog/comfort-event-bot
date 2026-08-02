@@ -192,7 +192,7 @@ export function resolveDisplayName(m: Member): string {
   return m.display_name || m.user_name || m.user_id;
 }
 
-// ponytail: (b) 既存の dailyCheck/admin に散らばる「回答不要」判定を 1 本化（ADR 0010）。
+// ponytail: (b) 既存の tick/admin に散らばる「回答不要」判定を 1 本化（ADR 0010）。
 /** 回答不要（通知のみ）か。recurring かつ requires_response=0 のとき true。 */
 export function isAnnounceOnly(n: Pick<Notification, 'type' | 'requires_response'>): boolean {
   return n.type === 'recurring' && !n.requires_response;

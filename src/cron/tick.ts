@@ -465,7 +465,7 @@ async function drainNotification(
     return;
   }
 
-  // recurring: 対象開催回の列挙。次回開催回の実体化は mainDailyCheck の日次ロールフォワードで
+  // recurring: 対象開催回の列挙。次回開催回の実体化は runTick の日次ロールフォワードで
   // 済ませてある（rrule 評価が重く毎ティック走らせられないため）。ここは実体化済みの行を処理する。
   const targets = futureOccs.filter((o) => o.status === 'scheduled');
   // 直近の回を優先して予算を使う（日付・時刻昇順）
@@ -571,9 +571,9 @@ async function drainOccurrence(ctx: TickCtx, n: Notification, occ: Occurrence): 
 
 /**
  * cron ティック（毎分・ADR 0013 ペース配信）。送信時刻に達した通知の今日の未送信分を予算内で送る。
- * index.ts の scheduled ハンドラから毎分呼ばれる（旧「1日1回」ではない）。
+ * index.ts の scheduled ハンドラから毎分呼ばれる。
  */
-export async function mainDailyCheck(env: Env): Promise<void> {
+export async function runTick(env: Env): Promise<void> {
   const now = getJSTNow();
   // config（数行の key/value）はティック冒頭に一括読みし、送信予算・ロールフォワード・
   // ロール同期マーカーの細切れ照会を 1 クエリに畳む。

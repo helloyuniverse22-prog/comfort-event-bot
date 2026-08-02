@@ -12,7 +12,7 @@ import {
 import { getOrCreateOccurrence } from '../src/db/occurrences';
 import { createNotification, getNotification, type NotificationInput } from '../src/db/notifications';
 import { claimSend, finishSend, isSendLogged, listSendLog, clearStaleClaims } from '../src/db/sendLog';
-import { deadlineNoticeKey } from '../src/cron/dailyCheck';
+import { deadlineNoticeKey } from '../src/cron/tick';
 import { getSendBudget, setConfig, getConfigInt } from '../src/db/config';
 import { responseDeadline } from '../src/lib/date';
 

@@ -50,7 +50,7 @@ import { upsertResponse, getResponseStatus, getStatusBuckets } from '../db/respo
 import { buildStatusMessage, buildAllStatusMessage, sendChannelMessage } from '../discord/rest';
 import { roleGateAllows } from '../discord/syncSegment';
 import { formatOccurrenceLabel, responseDeadline, getJSTNow } from '../lib/date';
-import { recruitNotificationNow } from '../cron/dailyCheck';
+import { recruitNotificationNow } from '../cron/tick';
 
 const EPHEMERAL = 64;
 

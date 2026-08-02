@@ -34,18 +34,20 @@ import { GroupingSettings } from './screens/GroupingSettings';
 import { Segments } from './screens/Segments';
 import { SegmentMembers } from './screens/SegmentMembers';
 import { Records } from './screens/Records';
+import { Reports } from './screens/Reports';
 import { SendLog } from './screens/SendLog';
 import { Setup } from './screens/Setup';
 
-type SecKey = 'notif-ops' | 'notifications' | 'segments' | 'records' | 'sendlog' | 'setup';
+type SecKey = 'notif-ops' | 'notifications' | 'segments' | 'records' | 'reports' | 'sendlog' | 'setup';
 
 const NAV: { key: SecKey; label: string }[] = [
   { key: 'notif-ops', label: '🔔 通知' },
   { key: 'notifications', label: '🛠 通知設定' },
   { key: 'segments', label: '👥 メンバー区分' },
   { key: 'records', label: '🗒 回答履歴' },
+  { key: 'reports', label: '📊 出勤レポート' },
   { key: 'sendlog', label: '📤 送信履歴' },
-  { key: 'setup', label: '⚙️ セットアップ' },
+  { key: 'setup', label: '⚙️ Bot 設定' },
 ];
 
 /** 旧 boot() と同じ復元規則: 保存 guild があり、ハッシュが無いか一致すれば workspace 直行 */
@@ -96,6 +98,13 @@ export function App() {
     setGuild(g);
     location.hash = 'g/' + g.id; // サーバー切替時は子ページパスをリセット（ADR 0016）
   };
+  // 退出後はそのサーバーを開けない。選択を解除してサーバー選択へ戻す（一覧も再取得）。
+  const leftGuild = () => {
+    localStorage.removeItem(GUILD_KEY);
+    invalidateGuilds();
+    setGuild(null);
+    location.hash = '';
+  };
 
   return (
     <>
@@ -104,7 +113,7 @@ export function App() {
       ) : !guild ? (
         <Picker onSelect={selectGuild} onLogout={logout} onError={onApiError} />
       ) : (
-        <Workspace guild={guild} onSelectGuild={selectGuild} onLogout={logout} onError={onApiError} toast={showToast} />
+        <Workspace guild={guild} onSelectGuild={selectGuild} onLogout={logout} onLeftGuild={leftGuild} onError={onApiError} toast={showToast} />
       )}
       <div className={'toast' + (toast ? ' show' : '') + (toast?.err ? ' err' : '')}>{toast?.msg}</div>
       <ConfirmHost />
@@ -190,12 +199,14 @@ function Workspace({
   guild,
   onSelectGuild,
   onLogout,
+  onLeftGuild,
   onError,
   toast,
 }: {
   guild: Guild;
   onSelectGuild: (g: Guild) => void;
   onLogout: () => void;
+  onLeftGuild: () => void;
   onError: (e: unknown) => void;
   toast: ToastFn;
 }) {
@@ -358,10 +369,12 @@ function Workspace({
               <Segments key={listKey} guild={guild} toast={toast} onOpenMembers={(uuid) => navigate(`segments/${uuid}/members`)} />
             ) : sec === 'records' ? (
               <Records guild={guild} toast={toast} />
+            ) : sec === 'reports' ? (
+              <Reports guild={guild} toast={toast} />
             ) : sec === 'sendlog' ? (
               <SendLog guild={guild} toast={toast} />
             ) : (
-              <Setup guild={guild} toast={toast} />
+              <Setup guild={guild} toast={toast} onLeft={onLeftGuild} />
             )}
           </Main>
         </Shell>

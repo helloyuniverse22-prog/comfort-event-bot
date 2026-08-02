@@ -8,7 +8,7 @@ import {
   listFutureOccurrencesAll,
 } from '../src/db/occurrences';
 import { claimSend, finishSend, hasSentKind, reclaimFailedSend, reclaimSentSend } from '../src/db/sendLog';
-import { inSendWindow, rollforwardWindow } from '../src/cron/dailyCheck';
+import { inSendWindow, rollforwardWindow } from '../src/cron/tick';
 import type { Notification } from '../src/db/types';
 
 const db = () => env.DB;

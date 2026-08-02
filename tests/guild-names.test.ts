@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { env } from 'cloudflare:test';
-import { resolveGuildName, GUILD_NAMES_KEY } from '../src/cron/dailyCheck';
+import { resolveGuildName, GUILD_NAMES_KEY } from '../src/cron/tick';
 import { getConfig } from '../src/db/config';
 
 // MOCK_DISCORD=1（vitest.config）: listGuilds は MOCK_GUILDS（1001=土曜サークル・1002=音楽部の集い）を返す。

@@ -1,7 +1,7 @@
 import type { Env } from '../env';
 import type { MentionMode, NotificationType } from '../db/types';
 import { isAnnounceOnly } from '../db/types';
-import { listGuilds, listGuildChannels, listGuildMembers, listGuildRoles } from '../discord/rest';
+import { listGuilds, listGuildChannels, listGuildMembers, listGuildRoles, leaveGuild } from '../discord/rest';
 import {
   listSegments,
   getSegmentByUuid,
@@ -20,6 +20,7 @@ import { getAllMembers, upsertMember, deleteMember, getMemberGuildName } from '.
 import {
   listNotifications,
   listNotificationsByGuild,
+  deactivateNotificationsForGuild,
   getNotification,
   getNotificationByUuid,
   createNotification,
@@ -59,9 +60,10 @@ import {
 } from '../db/groupings';
 import type { ConstraintDirection, ConstraintStrength, GroupingView } from '../db/types';
 import { claimSend, finishSend, listSendLog, reclaimFailedSend, reclaimSentSend } from '../db/sendLog';
+import { getAttendanceReport } from '../db/reports';
 import { getAllConfig, setConfig, getSendBudget, OCC_ROLLFORWARD_KEY } from '../db/config';
 import { sendChannelMessage, createButtonComponents } from '../discord/rest';
-import { recruitNotificationNow, sendRecruitment } from '../cron/dailyCheck';
+import { recruitNotificationNow, sendRecruitment } from '../cron/tick';
 import { formatDate, formatTimeRange, getJSTNow } from '../lib/date';
 import { getSetupStatus, registerCommandsForEnv } from './setup';
 
@@ -276,6 +278,7 @@ function toNotificationInput(b: Record<string, unknown>): NotificationInput | nu
  * - GET        /setup/status                  (シークレット有無・Interaction URL)
  * - POST       /setup/register-commands       ({guild_id?} スラッシュコマンド登録)
  * - GET        /guilds, /guilds/:id/channels, /guilds/:id/members, /guilds/:id/roles  (Discord 由来・読み取り専用)
+ * - POST       /guilds/:id/leave              (通知を全無効化してから bot を退出＝管理対象から外す)
  * - GET/POST   /segments[?guild_id=],         PUT/DELETE /segments/:id
  * - GET        /segments/:id/members,         POST /segments/:id/members ({user_id,display_name?,user_name?})
  * - PUT/DELETE /segments/:id/members/:userId  ({status} for PUT)
@@ -292,6 +295,7 @@ function toNotificationInput(b: Record<string, unknown>): NotificationInput | nu
  * - POST       /occurrences/:id/recruit       (単一開催回の即時募集・send_log 記録つき)
  * - GET        /occurrences/:id/responses,    GET /occurrences/:id/status (集計バケット)
  * - GET        /responses?limit=
+ * - GET        /reports/attendance?segment_uuid=[&notification_uuid=&from=&to=]  (出勤レポート)
  * - GET        /send-log[?notification_id=&limit=]   (リマインド送信履歴・④可視化)
  * - GET/PUT    /config                                (送信予算など実行時設定・⑦)
  * - GET        /send-estimate[?guild_id=]             (推奨上限の推定・⑦)
@@ -342,6 +346,21 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
     const guildRoles = path.match(/^\/guilds\/(\d+)\/roles$/);
     if (guildRoles && method === 'GET') {
       return json(await listGuildRoles(env, guildRoles[1]));
+    }
+    // サーバーからの退出（＝管理対象から外す）。先に通知を無効化してから退出することで、
+    // 退出後に cron が居ないサーバーへ送信を試みて Discord API エラーを出し続けるのを防ぐ。
+    // データは論理削除（active=0）のみで保持し、再招待時はそのまま復元できる。
+    const guildLeave = path.match(/^\/guilds\/(\d+)\/leave$/);
+    if (guildLeave && method === 'POST') {
+      const guildId = guildLeave[1];
+      const deactivated = await deactivateNotificationsForGuild(db, guildId);
+      try {
+        await leaveGuild(env, guildId);
+      } catch (e) {
+        // 無効化は済んでいるので、退出失敗は 502 で明示して手動キックを促す。
+        return json({ ok: false, deactivated, error: (e as Error).message }, 502);
+      }
+      return json({ ok: true, deactivated });
     }
 
     // ============ segments ============
@@ -943,6 +962,35 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
       const limit = parseLimit(url.searchParams.get('limit'), 200);
       const guildId = url.searchParams.get('guild_id') || undefined;
       return json(await listRecentResponses(db, limit, guildId));
+    }
+
+    // ============ reports（出勤レポート）============
+    if (path === '/reports/attendance' && method === 'GET') {
+      const seg = await getSegmentByUuid(db, url.searchParams.get('segment_uuid') || '');
+      if (!seg) return json({ error: 'segment not found' }, 404);
+      // 通知単位の絞り込み（任意）。母集団は区分のまま、開催回だけをその通知に限定する。
+      let notificationId: number | null = null;
+      const nuuid = url.searchParams.get('notification_uuid');
+      if (nuuid) {
+        const n = await getNotificationByUuid(db, nuuid);
+        if (!n || n.segment_id !== seg.id) {
+          return json({ error: 'notification not found in segment' }, 404);
+        }
+        notificationId = n.id;
+      }
+      // 日付は 'YYYY-MM-DD'（UI の date input）/'YYYY/MM/DD' 両対応。不正は未指定扱い。
+      const dateParam = (name: string): string | null => {
+        const v = url.searchParams.get(name);
+        return v && /^\d{4}[-/]\d{2}[-/]\d{2}$/.test(v) ? v.replace(/-/g, '/') : null;
+      };
+      return json(
+        await getAttendanceReport(db, seg.id, {
+          from: dateParam('from'),
+          to: dateParam('to'),
+          today: formatDate(getJSTNow()),
+          notificationId,
+        }),
+      );
     }
 
     // ============ send-log（リマインド送信履歴・④可視化）============
