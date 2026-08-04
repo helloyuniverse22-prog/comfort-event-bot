@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from 'react';
 import { api, type Guild } from '../api';
 import { confirmDialog, withBusy } from '../lib/dialog';
 import { showPreview } from '../lib/preview';
+import { occurrenceLabel } from '../lib/rrule';
 import { mountBoard, type BoardHandle, type Constraint, type GroupingView } from './GroupingBoard';
 import type { ToastFn } from '../App';
 
@@ -32,6 +33,9 @@ export function GroupingDialog({
   const dirtyRef = useRef(false);
   const [hasGrouping, setHasGrouping] = useState(false);
   const [loading, setLoading] = useState(true);
+  // どの開催回の配置か（見出し表示用・M4）。API の view.occurrence / view.notification から組み立てる。
+  const [occTitle, setOccTitle] = useState('');
+  const [notifName, setNotifName] = useState('');
 
   const setDirty = (v: boolean) => {
     dirtyRef.current = v;
@@ -52,6 +56,16 @@ export function GroupingDialog({
       constraintsRef.current = [];
     }
     setHasGrouping(!!view.grouping);
+    if (view.occurrence) {
+      setOccTitle(
+        occurrenceLabel(
+          view.occurrence.occurrence_date,
+          view.occurrence.start_time || view.notification?.start_time,
+          view.notification?.duration_minutes,
+        ),
+      );
+    }
+    setNotifName(view.notification?.name || '');
     boardRef.current?.render();
     setDirty(false);
   }
@@ -117,7 +131,7 @@ export function GroupingDialog({
 
   const attemptClose = async () => {
     if (dirtyRef.current) {
-      const ok = await confirmDialog('未保存の変更があります。閉じてもよろしいですか？', { okLabel: '閉じる', danger: true });
+      const ok = await confirmDialog('未保存の変更があります。破棄して閉じますか？', { okLabel: '破棄する', danger: true });
       if (!ok) return;
     }
     boardRef.current?.destroy();
@@ -179,7 +193,7 @@ export function GroupingDialog({
   };
 
   const clearBoard = async () => {
-    const ok = await confirmDialog('盤面の全メンバーを未割り当てに戻します（「保存」するまで確定しません）。', { okLabel: 'クリア' });
+    const ok = await confirmDialog('盤面の全メンバーを未割り当てに戻します（「保存」するまで確定しません）。', { okLabel: 'クリアする' });
     if (!ok) return;
     boardRef.current?.clearBoard();
   };
@@ -219,11 +233,10 @@ export function GroupingDialog({
   }
 
   const previewAnnounce = async (btn: HTMLElement | null) => {
-    await withBusy(btn, () => {
-      const { assignments, groupOf } = boardRef.current!.collectCurrentAssignments();
-      const pool_user_ids = [...groupOf.entries()].filter(([, g]) => g === null).map(([u]) => u);
-      return showPreview(`/occurrences/${ouuid}/grouping/announce?dry_run=1`, 'メンバー配置 プレビュー', toast, JSON.stringify({ assignments, pool_user_ids }));
-    });
+    const { assignments, groupOf } = boardRef.current!.collectCurrentAssignments();
+    const pool_user_ids = [...groupOf.entries()].filter(([, g]) => g === null).map(([u]) => u);
+    // busy は取得中のみ（ダイアログを開いている間はボタンのラベルを戻す・M22）
+    await showPreview(`/occurrences/${ouuid}/grouping/announce?dry_run=1`, 'メンバー配置 プレビュー', toast, JSON.stringify({ assignments, pool_user_ids }), btn);
   };
 
   const announce = async (btn: HTMLElement | null) => {
@@ -246,7 +259,7 @@ export function GroupingDialog({
         const c = channels.find((x) => x.id === id);
         return c ? '#' + c.name : id;
       };
-      const dest = n ? chName(n.grouping_channel_id || n.channel_id) : '通知の設定チャンネル';
+      const dest = n ? chName(n.grouping_channel_id || n.channel_id) : 'スケジュールの設定チャンネル';
       const msg =
         (gone.length ? `⚠️ 不参加に変更されたメンバーが配置に残っています（${gone.map((x: any) => x.name).join('、')}）。このまま` : '') +
         `現在のメンバー配置を ${dest} へ投稿します。（投稿先は「メンバー配置設定」で変更できます）`;
@@ -264,7 +277,7 @@ export function GroupingDialog({
   const editConstraints = async (e: React.MouseEvent) => {
     e.preventDefault();
     if (dirtyRef.current) {
-      const ok = await confirmDialog('未保存の変更があります。移動してもよろしいですか？', { okLabel: '移動する', danger: true });
+      const ok = await confirmDialog('未保存の変更があります。破棄して移動しますか？', { okLabel: '破棄する', danger: true });
       if (!ok) return;
     }
     boardRef.current?.destroy();
@@ -284,11 +297,18 @@ export function GroupingDialog({
                 attemptClose();
               }}
             >
-              通知
+              開催回
             </a>{' '}
             <span>›</span> <span>メンバー配置</span>
           </div>
-          <h3 id="groupingTitle">メンバー配置</h3>
+          <h3 id="groupingTitle">
+            メンバー配置{occTitle ? `: ${occTitle}` : ''}
+            {notifName && (
+              <span className="muted" style={{ fontWeight: 400, fontSize: 13, marginLeft: 8 }}>
+                {notifName}
+              </span>
+            )}
+          </h3>
         </div>
         <button type="button" className="page-back" aria-label="戻る" onClick={attemptClose}>
           ← 戻る
@@ -298,9 +318,9 @@ export function GroupingDialog({
         {loading && <p className="muted">読み込み中…</p>}
         <div ref={containerRef} style={{ display: loading ? 'none' : 'block' }} />
         <p className="muted" style={{ fontSize: 12.5, marginTop: 14 }}>
-          🔗 ペア制約（{constraintsRef.current.length}件）と配置結果の投稿先は通知単位の設定です。編集は{' '}
+          🔗 ペア制約（{constraintsRef.current.length}件）と配置結果の投稿先はスケジュール単位の設定です。編集は{' '}
           <a href="#" onClick={editConstraints}>
-            通知設定 › メンバー配置設定
+            スケジュール設定 › メンバー配置設定
           </a>{' '}
           から。制約違反があると盤面上に警告表示されます。
         </p>

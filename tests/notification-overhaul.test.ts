@@ -11,8 +11,7 @@ import {
 } from '../src/db/responses';
 import { getOrCreateOccurrence } from '../src/db/occurrences';
 import { createNotification, getNotification, type NotificationInput } from '../src/db/notifications';
-import { claimSend, finishSend, isSendLogged, listSendLog, clearStaleClaims } from '../src/db/sendLog';
-import { deadlineNoticeKey } from '../src/cron/tick';
+import { claimSend, finishSend, hasSentKind, isSendLogged, listSendLog, clearStaleClaims } from '../src/db/sendLog';
 import { getSendBudget, setConfig, getConfigInt } from '../src/db/config';
 import { responseDeadline } from '../src/lib/date';
 
@@ -104,15 +103,33 @@ describe('send_log の冪等（claim/finish・ADR 0013）', () => {
     expect(await claimSend(db(), quotaKey)).toBe(false);
   });
 
-  it('締切告知は日付を跨いでも開催回につき 1 回（send_date が実行日に依存しない）', async () => {
+  it('締切告知は日付を跨いでも開催回につき 1 回（hasSentKind・send_date は実送信日）', async () => {
     // 締切(50h前)通過の翌日 0 時台に同じ告知が再送された本番事故（2026-07-04）のリグレッション。
-    // deadlinePassed は締切〜開催日まで毎日 true のため、キーが実行日依存だと日毎に再送される。
+    // deadlinePassed は締切〜開催日まで毎ティック true のため、send_date キーだけだと日毎に再送される。
+    // 現方式（募集と同じ）: hasSentKind（send_date 無視）で送信済みを検知し、send_date は実送信日を記録する。
     const { n, occ } = await fixture();
-    const day1 = deadlineNoticeKey(n, occ); // 締切当日のティック
-    const day2 = deadlineNoticeKey(n, occ); // 日付が変わった翌日のティック
-    expect(day1.send_date).toBe(occ.occurrence_date); // 実行日ではなく開催回の日付
+    expect(await hasSentKind(db(), n.id, occ.id, 'deadline_notice')).toBe(false);
+    const day1 = { notification_id: n.id, occurrence_id: occ.id, kind: 'deadline_notice' as const, send_date: '2026/07/03' };
     expect(await claimSend(db(), day1)).toBe(true);
-    expect(await claimSend(db(), day2)).toBe(false); // 翌日も同一キー → 再送しない
+    await finishSend(db(), day1, true);
+    // 翌日のティック: send_date が変わっても hasSentKind が sent を検知 → 再送しない
+    expect(await hasSentKind(db(), n.id, occ.id, 'deadline_notice')).toBe(true);
+  });
+
+  it('締切告知: 旧方式の記録行（send_date=開催日）にも hasSentKind がヒットする（方式変更の互換）', async () => {
+    const { n, occ } = await fixture();
+    const oldKey = { notification_id: n.id, occurrence_id: occ.id, kind: 'deadline_notice' as const, send_date: occ.occurrence_date };
+    expect(await claimSend(db(), oldKey)).toBe(true);
+    await finishSend(db(), oldKey, true);
+    expect(await hasSentKind(db(), n.id, occ.id, 'deadline_notice')).toBe(true);
+  });
+
+  it('締切告知: 送信失敗（failed）は hasSentKind が数えない＝リトライ可能', async () => {
+    const { n, occ } = await fixture();
+    const key = { notification_id: n.id, occurrence_id: occ.id, kind: 'deadline_notice' as const, send_date: '2026/07/03' };
+    expect(await claimSend(db(), key)).toBe(true);
+    await finishSend(db(), key, false, 'boom');
+    expect(await hasSentKind(db(), n.id, occ.id, 'deadline_notice')).toBe(false);
   });
 });
 
@@ -155,7 +172,7 @@ describe('未送信ターゲットの取得（ペース配信・ADR 0013）', ()
 });
 
 describe('締切後変更フラグ（ADR 0014）', () => {
-  it('post_deadline_change が立ち・sticky（MAX で保持）・回答履歴に出る', async () => {
+  it('responses 側は sticky（MAX で保持）・回答履歴（response_log）は変更ごとの値', async () => {
     const { occ } = await fixture();
     // 締切前の通常回答 → フラグ 0
     await upsertResponse(db(), occ.id, 'A', 'A', '参加', false);
@@ -163,15 +180,20 @@ describe('締切後変更フラグ（ADR 0014）', () => {
 
     // 締切後の変更 → フラグ 1
     await upsertResponse(db(), occ.id, 'A', 'A', '不参加', true);
-    let rows = await listRecentResponses(db(), 50);
-    expect(rows.find((r) => r.user_id === 'A')?.post_deadline_change).toBe(1);
-
-    // その後の通常回答でも sticky（1 のまま）
+    // その後の通常回答
     await upsertResponse(db(), occ.id, 'A', 'A', '参加', false);
-    rows = await listRecentResponses(db(), 50);
-    const a = rows.find((r) => r.user_id === 'A');
-    expect(a?.status).toBe('参加');
-    expect(a?.post_deadline_change).toBe(1);
+
+    // responses（現在値）は sticky で 1 のまま
+    const cur = await db()
+      .prepare('SELECT post_deadline_change FROM responses WHERE occurrence_id = ? AND user_id = ?')
+      .bind(occ.id, 'A')
+      .first<{ post_deadline_change: number }>();
+    expect(cur?.post_deadline_change).toBe(1);
+
+    // 履歴は 3 行（新しい順）で、締切後だった変更の行だけフラグが立つ
+    const rows = (await listRecentResponses(db(), 50)).filter((r) => r.user_id === 'A');
+    expect(rows.map((r) => r.status)).toEqual(['参加', '不参加', '参加']);
+    expect(rows.map((r) => r.post_deadline_change)).toEqual([0, 1, 0]);
   });
 });
 

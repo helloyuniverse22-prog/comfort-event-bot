@@ -59,12 +59,12 @@ import {
   autoAssign,
 } from '../db/groupings';
 import type { ConstraintDirection, ConstraintStrength, GroupingView } from '../db/types';
-import { claimSend, finishSend, listSendLog, reclaimFailedSend, reclaimSentSend } from '../db/sendLog';
+import { claimSend, finishSend, hasSentKind, listSendLog, reclaimFailedSend, reclaimSentSend } from '../db/sendLog';
 import { getAttendanceReport } from '../db/reports';
 import { getAllConfig, setConfig, getSendBudget, OCC_ROLLFORWARD_KEY } from '../db/config';
 import { sendChannelMessage, createButtonComponents } from '../discord/rest';
 import { recruitNotificationNow, sendRecruitment } from '../cron/tick';
-import { formatDate, formatTimeRange, getJSTNow } from '../lib/date';
+import { formatDate, formatOccurrenceLabel, getJSTNow } from '../lib/date';
 import { getSetupStatus, registerCommandsForEnv } from './setup';
 
 function json(body: unknown, status = 200): Response {
@@ -592,11 +592,14 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
         return json({ error: 'occurrence does not belong to notification' }, 400);
       }
       await decideOccurrence(db, n.id, occ.id);
+      // 日付は他の投稿と同じ曜日付き書式（formatOccurrenceLabel）。本文由来の一斉ピングを防ぐため
+      // allowed_mentions={parse:[]}（意図的なメンションを載せる設計ではない・D8）。
       const announced = await sendChannelMessage(
         env,
         n.channel_id,
-        `✅ **開催日が確定しました**\n\n**${occ.occurrence_date}** ${formatTimeRange(occ.start_time || n.start_time, n.duration_minutes)} に開催します！\n\n出欠が変わる場合は下のボタンで回答してください。`,
+        `✅ **開催日が確定しました**\n\n**${formatOccurrenceLabel(occ.occurrence_date, occ.start_time || n.start_time, n.duration_minutes)}** に開催します！\n\n出欠が変わる場合は下のボタンで回答してください。`,
         createButtonComponents(occ.id, n.type),
+        { parse: [] },
       );
       return json({ ok: true, decided_occurrence_uuid: occ.uuid, announced });
     }
@@ -673,7 +676,9 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
       if (!occ) return json({ error: 'Not found' }, 404);
       const n = await getNotification(db, occ.notification_id);
       if (!n) return json({ error: 'Not found' }, 404);
-      return json(await getStatusBuckets(db, occ.id, n.segment_id));
+      // recruited: この開催回の募集/告知を投稿済みか（「開催回」タブの「募集済み/告知済み」表示用・M6）
+      const buckets = await getStatusBuckets(db, occ.id, n.segment_id);
+      return json({ ...buckets, recruited: await hasSentKind(db, n.id, occ.id, 'recruit') });
     }
     // /occurrences/:uuid/recruit （単一開催回の即時募集・臨時回向け）
     // send_log に claim/finish を記録し、cron の窓内自動募集（hasSentKind 照合）と二重にならないようにする。
@@ -731,7 +736,13 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
       const occ = await getOccurrenceByUuid(db, occGrouping[1]);
       if (!occ) return json({ error: 'Not found' }, 404);
       if (method === 'GET') {
-        return json(await getGroupingView(db, occ.id));
+        // どの開催回の配置か UI 見出しに出すため、開催回と通知の表示情報を同送する（M4）
+        const n = await getNotification(db, occ.notification_id);
+        return json({
+          ...(await getGroupingView(db, occ.id)),
+          occurrence: { occurrence_date: occ.occurrence_date, start_time: occ.start_time },
+          notification: n ? { name: n.name, start_time: n.start_time, duration_minutes: n.duration_minutes } : null,
+        });
       }
       if (method === 'PUT') {
         const b = (await request.json()) as { group_count?: number };
@@ -863,7 +874,7 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
       }
       const lines: string[] = [];
       lines.push(
-        `🧩 **メンバー配置** ${occ.occurrence_date} ${formatTimeRange(occ.start_time || n.start_time, n.duration_minutes)}`,
+        `🧩 **メンバー配置** ${formatOccurrenceLabel(occ.occurrence_date, occ.start_time || n.start_time, n.duration_minutes)}`,
       );
       lines.push('');
       for (const g of view.groups) {
@@ -885,8 +896,9 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
       if (dryRun) {
         return json({ ok: true, content, dry_run: true });
       }
-      // 投稿先はマスター設定（grouping_channel_id・NULL なら募集チャンネル）に従う
-      const announced = await sendChannelMessage(env, n.grouping_channel_id ?? n.channel_id, content);
+      // 投稿先はマスター設定（grouping_channel_id・NULL なら募集チャンネル）に従う。
+      // グループ名・表示名はユーザー由来文字列のため allowed_mentions={parse:[]} で一斉ピングを防ぐ（D8）。
+      const announced = await sendChannelMessage(env, n.grouping_channel_id ?? n.channel_id, content, null, { parse: [] });
       return json({ ok: announced, content });
     }
 

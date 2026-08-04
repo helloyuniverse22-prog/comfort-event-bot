@@ -98,7 +98,7 @@ export function Reports({ guild, toast }: { guild: Guild; toast: ToastFn }) {
             value={segUuid}
             onChange={(e) => {
               setSegUuid(e.target.value);
-              setNotifUuid(''); // 区分が変わると通知の候補も変わるためリセット
+              setNotifUuid(''); // 区分が変わるとスケジュールの候補も変わるためリセット
             }}
             style={{ minWidth: 180 }}
           >
@@ -110,9 +110,9 @@ export function Reports({ guild, toast }: { guild: Guild; toast: ToastFn }) {
           </select>
         </div>
         <div>
-          <label>通知</label>
+          <label>スケジュール</label>
           <select value={notifUuid} onChange={(e) => setNotifUuid(e.target.value)} style={{ minWidth: 180 }}>
-            <option value="">すべての通知</option>
+            <option value="">すべてのスケジュール</option>
             {notifs
               .filter((n) => n.segment_id === (segments.find((s) => s.uuid === segUuid)?.id ?? -1) && n.requires_response)
               .map((n) => (
@@ -152,23 +152,26 @@ export function Reports({ guild, toast }: { guild: Guild; toast: ToastFn }) {
           options={{
             search: false,
             columns: [
-              { id: 'member', header: 'メンバー', accessor: (r: ReportRow) => r.name || r.user_id },
+              { id: 'member', header: 'メンバー', filter: 'combo', accessor: (r: ReportRow) => r.name || r.user_id },
               {
                 id: 'rate',
                 header: '出勤率',
+                filter: 'number',
                 accessor: (r: ReportRow) => (r.rate === null ? '' : String(Math.round(r.rate * 100))),
                 render: (v: string) => (v === '' ? '<span class="muted">—</span>' : esc(v) + '%'),
               },
               { id: 'count', header: '出勤回数', accessor: (r: ReportRow) => `${r.attended} / ${r.total}回` },
               ...[0, 1, 2].map((i) => ({
                 id: 'recent' + i,
-                header: ['前回出勤', '前々回出勤', '前々々回出勤'][i],
+                header: ['前回出勤', '2回前出勤', '3回前出勤'][i],
+                filter: 'date' as const,
                 accessor: (r: ReportRow) => r.recent[i] || '',
                 render: (v: string) => (v ? esc(v) : '<span class="muted">—</span>'),
               })),
               {
                 id: 'first',
                 header: '初出勤',
+                filter: 'date',
                 accessor: (r: ReportRow) => r.first_date || '',
                 render: (v: string) => (v ? esc(v) : '<span class="muted">—</span>'),
               },

@@ -1,5 +1,5 @@
 // 大きいフォーム用モーダル（ネイティブ <dialog class="modal-lg">）。DS の <Modal> は確認用の
-// 小さい `.modal` 専用のため、区分/通知など編集フォームのオーバーレイはこちらを使う。
+// 小さい `.modal` 専用のため、区分/臨時回など編集フォームのオーバーレイはこちらを使う。
 import * as React from 'react';
 import { useEffect, useRef } from 'react';
 

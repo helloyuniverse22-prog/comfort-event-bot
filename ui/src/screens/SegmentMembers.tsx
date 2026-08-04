@@ -1,4 +1,4 @@
-// 区分メンバー（手動ピッカー / ロール同期・ADR 0009）。通知設定と同格の子ページ。
+// 区分メンバー（手動ピッカー / ロール同期・ADR 0009）。スケジュール設定と同格の子ページ。
 import * as React from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import { TextField } from '../../../design-system/src';
@@ -9,6 +9,16 @@ import type { ToastFn } from '../App';
 type Segment = { uuid: string; name: string; mention_role_id?: string | null; members_synced_at?: string | null };
 type SegMember = { user_id: string; user_name?: string | null; display_name?: string | null; status?: string | null };
 type GuildMember = { user_id: string; user_name?: string | null; display_name?: string | null };
+type Role = { id: string; name: string };
+
+/** members_synced_at は SQLite の UTC 'YYYY-MM-DD HH:MM:SS'。JST・他画面と同じスラッシュ書式で表示する（M2） */
+function syncedAtJst(utc?: string | null): string {
+  if (!utc) return '未同期';
+  const d = new Date(utc.replace(' ', 'T') + 'Z');
+  return isNaN(d.getTime())
+    ? utc
+    : d.toLocaleString('sv-SE', { timeZone: 'Asia/Tokyo' }).slice(0, 16).replace(/-/g, '/');
+}
 
 export function SegmentMembers({
   guild,
@@ -24,6 +34,7 @@ export function SegmentMembers({
   const [seg, setSeg] = useState<Segment | null>(null);
   const [list, setList] = useState<SegMember[] | null>(null);
   const [guildMembers, setGuildMembers] = useState<GuildMember[] | null>(null);
+  const [roles, setRoles] = useState<Role[] | null>(null);
   const [pickerErr, setPickerErr] = useState('');
   const [search, setSearch] = useState('');
 
@@ -46,6 +57,17 @@ export function SegmentMembers({
 
   const roleManaged = !!(seg && seg.mention_role_id);
   const isEveryone = !!(seg && seg.mention_role_id === '@everyone');
+
+  // ロール管理区分の説明行をロール名で出す（失敗時は生IDフォールバック・ベストエフォート）
+  useEffect(() => {
+    if (!roleManaged || isEveryone || roles !== null) return;
+    api(`/guilds/${guild.id}/roles`).then(setRoles, () => setRoles([]));
+  }, [roleManaged, isEveryone, roles, guild.id]);
+  const roleLabel = seg?.mention_role_id
+    ? roles?.some((r) => r.id === seg.mention_role_id)
+      ? '@' + roles.find((r) => r.id === seg.mention_role_id)!.name
+      : seg.mention_role_id
+    : '';
 
   useEffect(() => {
     if (!seg || roleManaged || guildMembers !== null) return;
@@ -179,8 +201,11 @@ export function SegmentMembers({
         {roleManaged ? (
           <>
             <div className="summary" style={{ marginTop: 14 }}>
-              🔗 <b>ロール管理区分</b>：メンバーは Discord ロール <code>{isEveryone ? '@everyone（全員）' : seg?.mention_role_id}</code>{' '}
-              から自動同期されます（手動の追加/外すは不可・休止は可）。最終同期: {seg?.members_synced_at || '未同期'}
+              🔗{' '}
+              <span>
+                <b>ロール管理区分</b>：メンバーは Discord ロール「{isEveryone ? '@everyone（全員）' : roleLabel}」
+                から自動同期されます（手動での追加・除外は不可、休止は可）。最終同期: {syncedAtJst(seg?.members_synced_at)}
+              </span>
             </div>
             {isEveryone && (
               <p className="muted" style={{ fontSize: 12, color: 'var(--warn)' }}>

@@ -318,6 +318,14 @@ export async function deleteNotification(db: D1Database, id: number): Promise<bo
     )
     .bind(id)
     .run();
+  await db
+    .prepare(
+      `DELETE FROM response_log WHERE occurrence_id IN (
+         SELECT id FROM occurrences WHERE notification_id = ?
+       )`,
+    )
+    .bind(id)
+    .run();
   // グループ分け関連のカスケード削除（ADR 0015）
   await db
     .prepare(

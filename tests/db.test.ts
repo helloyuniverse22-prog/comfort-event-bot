@@ -8,7 +8,7 @@ import {
   getActiveSegmentMembers,
   listSegmentMembers,
 } from '../src/db/segments';
-import { upsertResponse, getStatusBuckets, checkQuotaForNotification } from '../src/db/responses';
+import { upsertResponse, getStatusBuckets, checkQuotaForNotification, listRecentResponses } from '../src/db/responses';
 import { claimSend } from '../src/db/sendLog';
 import type { Notification } from '../src/db/types';
 
@@ -281,3 +281,26 @@ describe('checkQuotaForNotification', () => {
   });
 });
 
+
+describe('response_log（回答の変更履歴・0022）', () => {
+  it('回答を変更すると 1 変更 = 1 行が残り、listRecentResponses が新しい順に全行返す', async () => {
+    const seg = await createSegment(db(), { guild_id: 'g1', name: 'キャスト', mention_role_id: null });
+    const n = await insertNotification(GUILD, seg.id);
+    const occId = await insertOccurrence(n.id, '2025/01/04');
+
+    await upsertResponse(db(), occId, 'u1', 'n1', '未定');
+    await upsertResponse(db(), occId, 'u1', 'n1', '参加', true); // 締切後に変更
+
+    // responses は最新値のみ（従来どおり）
+    const cur = await db()
+      .prepare('SELECT status FROM responses WHERE occurrence_id = ? AND user_id = ?')
+      .bind(occId, 'u1')
+      .first<{ status: string }>();
+    expect(cur?.status).toBe('参加');
+
+    // 履歴は 2 行、新しい順。post_deadline_change は行ごと（1 行目のみ 1）
+    const hist = await listRecentResponses(db(), 10, GUILD);
+    expect(hist.map((r) => r.status)).toEqual(['参加', '未定']);
+    expect(hist.map((r) => r.post_deadline_change)).toEqual([1, 0]);
+  });
+});

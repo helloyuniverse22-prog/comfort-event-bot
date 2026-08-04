@@ -1,4 +1,4 @@
-// 通知フォームの「募集メッセージ簡易プレビュー」と「配信タイムライン整合性チェック」。
+// スケジュールフォームの「募集/告知メッセージ簡易プレビュー」と「送信タイムライン整合性チェック」。
 // 旧 buildRecruitPreviewText()/notifPreview() の純関数移植（DOM 非依存）。
 import { nextWeekdayDates, wdLabel, type RepeatMode } from './rrule';
 
@@ -14,11 +14,18 @@ export type PreviewInput = {
   requireResponse: boolean;
 };
 
+/** 日時・締切の計算済みテキスト（新旧フォームのプレビューで共用） */
+export type PreviewParts = {
+  mention: string | null;
+  dateText: string;
+  deadline: string | null;
+};
+
 /** 完全再現ではなく、フォーム入力に即時追従する部分のみの近似（メンション/複雑な月次・隔週パリティは簡略化）。 */
-export function buildRecruitPreviewText(v: PreviewInput): string {
-  let mentionLine = '';
-  if (v.mention === 'role') mentionLine = '@ロール or @everyone\n';
-  else if (v.mention === 'members') mentionLine = '@対象メンバー全員\n';
+export function buildRecruitPreviewParts(v: PreviewInput): PreviewParts {
+  let mention: string | null = null;
+  if (v.mention === 'role') mention = '@ロール or @everyone';
+  else if (v.mention === 'members') mention = '@対象メンバー全員';
 
   let dateStr = '(次回開催日)';
   let dateObj: string | null = null;
@@ -48,22 +55,25 @@ export function buildRecruitPreviewText(v: PreviewInput): string {
   } else if (v.startTime) {
     timeStr = `${v.startTime}〜`;
   }
-  const dateLine = `日時: **${dateStr} ${timeStr}**`;
-
-  let deadlineLine = '';
+  let deadline: string | null = null;
   if (v.requireResponse && Number.isFinite(v.deadlineHours) && (v.deadlineHours as number) > 0 && dateObj && v.startTime) {
     const [yy, mm, dd] = dateObj.split('/').map(Number);
     const [hh, mi] = v.startTime.split(':').map(Number);
     const evt = new Date(yy, mm - 1, dd, hh, mi);
     evt.setHours(evt.getHours() - (v.deadlineHours as number));
-    const dlStr = `${evt.getFullYear()}/${String(evt.getMonth() + 1).padStart(2, '0')}/${String(evt.getDate()).padStart(2, '0')} ${String(evt.getHours()).padStart(2, '0')}:${String(evt.getMinutes()).padStart(2, '0')}`;
-    deadlineLine = `\n回答締切: **${dlStr}**`;
+    deadline = `${evt.getFullYear()}/${String(evt.getMonth() + 1).padStart(2, '0')}/${String(evt.getDate()).padStart(2, '0')} ${String(evt.getHours()).padStart(2, '0')}:${String(evt.getMinutes()).padStart(2, '0')}`;
   }
 
-  let msg = mentionLine;
+  return { mention, dateText: `${dateStr} ${timeStr}`, deadline };
+}
+
+export function buildRecruitPreviewText(v: PreviewInput): string {
+  const p = buildRecruitPreviewParts(v);
+  let msg = p.mention ? p.mention + '\n' : '';
   msg += `**${v.title || '(見出しを入力)'}**\n\n`;
   if (v.body) msg += v.body + '\n\n';
-  msg += dateLine + deadlineLine;
+  msg += `日時: **${p.dateText}**`;
+  if (p.deadline) msg += `\n回答締切: **${p.deadline}**`;
   if (v.requireResponse) msg += '\n\n〔参加〕〔不参加〕〔未定〕〔状況確認〕';
   return msg;
 }
@@ -82,7 +92,7 @@ export type TimelineInput = {
 export function notifPreviewSummary(v: TimelineInput): { text: string; warns: string[] } {
   const show = (n: number | null) => (n != null && isFinite(n) ? n : '—');
   const sh = String(v.sendHour).padStart(2, '0');
-  const send = `毎日 ${sh}:00 に配信`;
+  const send = `毎日 ${sh}:00 に送信`;
   const warns: string[] = [];
   if (!v.requireResponse) {
     return { text: `${show(v.recruitDays)}日前に告知 → 🎉 開催（${v.scheduleText}）／${send}`, warns };

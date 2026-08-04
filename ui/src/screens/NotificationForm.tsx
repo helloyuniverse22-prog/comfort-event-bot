@@ -1,4 +1,4 @@
-// 通知の新規作成・編集ページ（旧 #nDialog の子ページ化。ADR 0016）。
+// スケジュールの新規作成・編集ページ（旧 #nDialog の子ページ化。ADR 0016）。
 // 単発(oneoff)UIは撤去済み・recurring 専用（旧実装踏襲。type は常に 'recurring' で送信）。
 import * as React from 'react';
 import { useEffect, useMemo, useState } from 'react';
@@ -119,7 +119,7 @@ export function NotificationForm({
           const n: NotifDetail = await api('/notifications/' + nuuid);
           if (!alive) return;
           if (n.type === 'oneoff') {
-            toast('単発通知の編集は現在無効です。', true);
+            toast('単発（旧形式）の編集は現在無効です。', true);
             setNotFound(true);
             return;
           }
@@ -127,7 +127,7 @@ export function NotificationForm({
         }
       } catch (e) {
         if (nuuid) {
-          toast('通知が見つかりません', true);
+          toast('スケジュールが見つかりません', true);
           setNotFound(true);
         } else {
           toast(e instanceof Error ? e.message : String(e), true);
@@ -214,12 +214,7 @@ export function NotificationForm({
 
   const attemptClose = async () => {
     if (dirty) {
-      const ok = await confirmDialog('保存していない変更は失われます。', {
-        title: '編集中の内容を破棄しますか？',
-        okLabel: '破棄して閉じる',
-        cancelLabel: '編集に戻る',
-        danger: true,
-      });
+      const ok = await confirmDialog('未保存の変更があります。破棄して閉じますか？', { okLabel: '破棄する', danger: true });
       if (!ok) return;
     }
     onDirtyChange(false);
@@ -304,11 +299,11 @@ export function NotificationForm({
                 attemptClose();
               }}
             >
-              通知設定
+              スケジュール設定
             </a>{' '}
             <span>›</span> <span>{nuuid ? '編集' : '新規'}</span>
           </div>
-          <h3 id="nFormTitle">{nuuid ? '編集' : '新規通知'}</h3>
+          <h3 id="nFormTitle">{nuuid ? '編集' : '新規スケジュール'}</h3>
         </div>
         <button type="button" className="page-back" aria-label="戻る" onClick={attemptClose}>
           ← 戻る
@@ -456,7 +451,7 @@ export function NotificationForm({
           {mode === 'biweekly' && (
             <div>
               <label>
-                次にこの通知で開催する日 <span className="muted">（隔週の起点）</span>
+                次にこのスケジュールで開催する日 <span className="muted">（隔週の起点）</span>
               </label>
               <Select value={biweeklyAnchor} onChange={(e) => setBiweeklyAnchor(e.target.value)}>
                 {biweeklyOptions.map((d) => (
@@ -477,15 +472,15 @@ export function NotificationForm({
             <div />
           </div>
 
-          <div className="subhead">🗳️ 回答</div>
+          <div className="subhead">🗳️ 出欠確認</div>
           <div className="setting-row">
             <div className="setting-row-main">
-              <div className="setting-row-title">回答を集める（参加/不参加/未定）</div>
-              <div className="setting-row-desc">オフ＝告知のみ。募集と開催だけになり、リマインド・締切・ノルマ・番号は無効になります。</div>
+              <div className="setting-row-title">出欠確認（参加/不参加/未定の回答を集める）</div>
+              <div className="setting-row-desc">オフ＝出欠をとらず、開催告知の投稿だけを行います。リマインド・締切・ノルマ・番号は無効になります。</div>
             </div>
             <div className="setting-row-control">
               <Switch
-                aria-label="回答を集める（参加/不参加/未定）"
+                aria-label="出欠確認（参加/不参加/未定の回答を集める）"
                 checked={requireResponse}
                 onChange={(e) => setRequireResponse(e.target.checked)}
               />
@@ -516,7 +511,7 @@ export function NotificationForm({
           <div className="row">
             <div>
               <label>
-                通知名 <span className="req">✱</span>
+                スケジュール名 <span className="req">✱</span>
               </label>
               <TextField placeholder="例: 土曜定例・キャスト出欠" value={name} onChange={(e) => setName(e.target.value)} />
             </div>
@@ -592,7 +587,7 @@ export function NotificationForm({
           </div>
 
           <div className="tl-send muted">
-            🕘 通知配信時刻{' '}
+            🕘 送信時刻{' '}
             <Select style={{ display: 'inline-block', width: 'auto' }} value={sendHour} onChange={(e) => setSendHour(e.target.value)}>
               {Array.from({ length: 24 }, (_, h) => (
                 <option key={h} value={h}>
@@ -617,9 +612,10 @@ export function NotificationForm({
           <details className="section" open={advancedOpen} onToggle={(e) => setAdvancedOpen((e.target as HTMLDetailsElement).open)}>
             <summary>詳細設定（必要に応じて）</summary>
             <div className="section-body">
-              <div className="subhead">締切後の変更通知</div>
+              {/* 回答を集めない（告知のみ）場合、回答に依存する設定は見出しごと出さない（M9） */}
               {!announceOnly && (
                 <div>
+                  <div className="subhead">締切後の変更通知</div>
                   <label>
                     変更通知チャンネル <span className="muted">（締切後の変更を投稿・空欄＝投稿チャンネル）</span>
                   </label>
@@ -633,9 +629,9 @@ export function NotificationForm({
                 </div>
               )}
 
-              <div className="subhead">機能</div>
               {!announceOnly && (
                 <>
+                  <div className="subhead">機能</div>
                   <div className="setting-row">
                     <div className="setting-row-main">
                       <div className="setting-row-title">ノルマ（参加間隔の督促）</div>
@@ -672,8 +668,8 @@ export function NotificationForm({
           </details>
         </div>
 
-        <aside className="preview-pane" aria-label="募集メッセージのプレビュー">
-          <h4>📺 募集メッセージ プレビュー</h4>
+        <aside className="preview-pane" aria-label={announceOnly ? '告知メッセージのプレビュー' : '募集メッセージのプレビュー'}>
+          <h4>📺 {announceOnly ? '告知' : '募集'}メッセージ プレビュー</h4>
           <pre className="preview-content">{previewText}</pre>
           <p className="preview-note">※ @メンションと候補日一覧は投稿時に展開されます。月次/隔週は次回開催日が近似表示です。</p>
         </aside>

@@ -120,7 +120,14 @@ export function fmtTimeRange(start: string, dur?: number | null): string {
   return `${start}〜${e.nextDay ? '翌' : ''}${e.time}`;
 }
 
-/** 通知一覧向けの短い自然文（毎週/隔週/毎月＋時間帯）。recurring 専用（oneoff は呼び出し側で別処理）。 */
+/** 開催回の表示ラベル「YYYY/MM/DD (曜) HH:MM〜HH:MM」（サーバ formatOccurrenceLabel と同等） */
+export function occurrenceLabel(dateStr: string, time?: string | null, dur?: number | null): string {
+  const [y, m, d] = (dateStr || '').split('/').map(Number);
+  const w = y && m && d ? '日月火水木金土'[new Date(y, m - 1, d).getDay()] : '';
+  return `${dateStr}${w ? ` (${w})` : ''}${time ? ' ' + fmtTimeRange(time, dur) : ''}`;
+}
+
+/** スケジュール一覧向けの短い自然文（毎週/隔週/毎月＋時間帯）。recurring 専用（oneoff は呼び出し側で別処理）。 */
 export function humanRRule(rrule: string | null | undefined, time: string | null | undefined, dur: number | null | undefined): string {
   const b = parseRRuleToBuilder(rrule);
   const wd = wdLabel(b.byday);

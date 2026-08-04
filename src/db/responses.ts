@@ -18,18 +18,26 @@ export async function upsertResponse(
 ): Promise<void> {
   const ts = new Date().toISOString();
   const flag = postDeadlineChange ? 1 : 0;
-  await db
-    .prepare(
-      `INSERT INTO responses (occurrence_id, user_id, user_name, status, updated_at, post_deadline_change)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(occurrence_id, user_id) DO UPDATE SET
-         status = excluded.status,
-         user_name = excluded.user_name,
-         updated_at = excluded.updated_at,
-         post_deadline_change = MAX(responses.post_deadline_change, excluded.post_deadline_change)`,
-    )
-    .bind(occurrenceId, userId, userName ?? null, status, ts, flag)
-    .run();
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO responses (occurrence_id, user_id, user_name, status, updated_at, post_deadline_change)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(occurrence_id, user_id) DO UPDATE SET
+           status = excluded.status,
+           user_name = excluded.user_name,
+           updated_at = excluded.updated_at,
+           post_deadline_change = MAX(responses.post_deadline_change, excluded.post_deadline_change)`,
+      )
+      .bind(occurrenceId, userId, userName ?? null, status, ts, flag),
+    // 変更履歴（追記型・0022）。responses は最新値のみのため遷移はこちらに残す
+    db
+      .prepare(
+        `INSERT INTO response_log (occurrence_id, user_id, user_name, status, post_deadline_change, changed_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(occurrenceId, userId, userName ?? null, status, flag, ts),
+  ]);
 }
 
 /** 単一ユーザの現在の回答ステータスを取得（未回答なら null）。締切後変更の検知に使う（ADR 0014）。 */
@@ -158,16 +166,19 @@ export async function listRecentResponses(
 ): Promise<
   Array<Response & { occurrence_date: string; occurrence_time: string; notification_name: string }>
 > {
+  // response_log（追記型・0022）を表示する。同一人物の △→◯ のような変更も 1 行ずつ残る。
+  // 列名は旧 responses 版と同じ形（updated_at 等）に合わせ、API/UI の契約は変えない。
   const where = guildId ? 'WHERE n.guild_id = ?' : '';
   const stmt = db.prepare(
-    `SELECT r.occurrence_id, r.user_id, r.user_name, r.status, r.updated_at, r.post_deadline_change,
+    `SELECT r.occurrence_id, r.user_id, r.user_name, r.status, r.changed_at AS updated_at,
+            r.post_deadline_change,
             o.occurrence_date AS occurrence_date, o.start_time AS occurrence_time,
             n.name AS notification_name
-       FROM responses r
+       FROM response_log r
        JOIN occurrences o ON o.id = r.occurrence_id
        JOIN notifications n ON n.id = o.notification_id
        ${where}
-      ORDER BY o.occurrence_date DESC, o.start_time DESC, r.updated_at DESC
+      ORDER BY o.occurrence_date DESC, o.start_time DESC, r.changed_at DESC, r.id DESC
       LIMIT ?`,
   );
   const bound = guildId ? stmt.bind(guildId, limit) : stmt.bind(limit);

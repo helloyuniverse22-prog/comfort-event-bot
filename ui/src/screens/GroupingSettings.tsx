@@ -1,4 +1,4 @@
-// メンバー配置設定（通知設定の子ページ・Notification 単位のマスター設定）
+// メンバー配置設定（スケジュール設定の子ページ・Notification 単位のマスター設定）
 // = 配置結果の投稿先チャンネル ＋ ペア制約。どちらも即時保存。
 import * as React from 'react';
 import { useEffect, useState } from 'react';
@@ -66,7 +66,7 @@ export function GroupingSettings({
         }
       }
     } catch (e) {
-      toast('通知が見つかりません', true);
+      toast('スケジュールが見つかりません', true);
       setNotFound(true);
     } finally {
       setLoading(false);
@@ -140,7 +140,7 @@ export function GroupingSettings({
                 onClose();
               }}
             >
-              通知設定
+              スケジュール設定
             </a>{' '}
             <span>›</span> <span>メンバー配置設定</span>
           </div>
@@ -152,12 +152,12 @@ export function GroupingSettings({
       </div>
       <div className="modal-body">
         <div className="summary">
-          🧩 <span>この通知の全開催日で共有される、メンバー配置まわりのマスター設定です。変更はその場で保存されます。</span>
+          🧩 <span>このスケジュールの全開催回で共有される、メンバー配置まわりのマスター設定です。変更はその場で保存されます。</span>
         </div>
 
         <h3 style={{ marginTop: 18 }}>📣 配置結果の投稿先</h3>
         <p className="muted" style={{ fontSize: 12.5, margin: '0 0 6px' }}>
-          「結果をチャンネルへ投稿」の投稿先チャンネルです。
+          メンバー配置画面の「📣 配置をチャンネルへ投稿」の投稿先チャンネルです。
         </p>
         <Select style={{ maxWidth: 360 }} value={gChannel} onChange={(e) => saveChannel(e.target.value)}>
           <option value="">募集と同じチャンネル（{chName(notif.channel_id)}）</option>

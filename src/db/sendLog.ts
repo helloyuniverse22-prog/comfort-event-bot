@@ -167,6 +167,7 @@ export async function listSendLog(
       `SELECT s.id, s.notification_id, s.occurrence_id, s.user_id, s.kind, s.send_date,
               s.status, s.error, s.created_at,
               n.name AS notification_name,
+              n.requires_response AS requires_response,
               COALESCE(gp.display_name, m.display_name, m.user_name) AS user_name,
               (SELECT o.occurrence_date FROM occurrences o WHERE o.id = s.occurrence_id AND s.occurrence_id != 0) AS occurrence_date
          FROM send_log s

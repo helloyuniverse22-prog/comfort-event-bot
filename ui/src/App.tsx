@@ -29,6 +29,7 @@ import { parseHash, routeFromRest, sectionForRoute, type Route } from './lib/rou
 import { NotificationsScreen } from './screens/Notifications';
 import { NotifOps } from './screens/NotifOps';
 import { NotificationForm } from './screens/NotificationForm';
+import { NotificationFormV2 } from './screens/NotificationFormV2';
 import { GroupingDialog } from './screens/GroupingDialog';
 import { GroupingSettings } from './screens/GroupingSettings';
 import { Segments } from './screens/Segments';
@@ -40,14 +41,26 @@ import { Setup } from './screens/Setup';
 
 type SecKey = 'notif-ops' | 'notifications' | 'segments' | 'records' | 'reports' | 'sendlog' | 'setup';
 
-const NAV: { key: SecKey; label: string }[] = [
-  { key: 'notif-ops', label: '🔔 通知' },
-  { key: 'notifications', label: '🛠 通知設定' },
-  { key: 'segments', label: '👥 メンバー区分' },
-  { key: 'records', label: '🗒 回答履歴' },
-  { key: 'reports', label: '📊 出勤レポート' },
-  { key: 'sendlog', label: '📤 送信履歴' },
-  { key: 'setup', label: '⚙️ Bot 設定' },
+// 絵文字は VS16（️）付きで統一（🛠・🗒 は無印だと環境によりモノクロ字形になる・M19）
+// グループ = 上段「運用・記録」→ 下段「設定」（設定内はデータ階層順: 区分→スケジュール→Bot）
+const NAV_GROUPS: { label: string; items: { key: SecKey; label: string }[] }[] = [
+  {
+    label: '運用・記録',
+    items: [
+      { key: 'notif-ops', label: '📅 開催回' },
+      { key: 'records', label: '🗒️ 回答履歴' },
+      { key: 'reports', label: '📊 出勤レポート' },
+      { key: 'sendlog', label: '📤 送信履歴' },
+    ],
+  },
+  {
+    label: '設定',
+    items: [
+      { key: 'segments', label: '👥 メンバー区分' },
+      { key: 'notifications', label: '🛠️ スケジュール設定' },
+      { key: 'setup', label: '⚙️ Bot 設定' },
+    ],
+  },
 ];
 
 /** 旧 boot() と同じ復元規則: 保存 guild があり、ハッシュが無いか一致すれば workspace 直行 */
@@ -162,7 +175,7 @@ function Picker({
   return (
     <div>
       <Topbar>
-        <h1 style={{ margin: 0 }}>🗓 EventBot 管理</h1>
+        <h1 style={{ margin: 0 }}>🗓️ EventBot 管理</h1>
         <button className="btn secondary" onClick={onLogout}>ログアウト</button>
       </Topbar>
       <main style={{ maxWidth: 760, margin: '0 auto' }}>
@@ -261,7 +274,7 @@ function Workspace({
 
   const selectSection = async (s: SecKey) => {
     if (dirty) {
-      const ok = await confirmDialog('未保存の変更があります。移動してもよろしいですか？', { okLabel: '移動する', danger: true });
+      const ok = await confirmDialog('未保存の変更があります。破棄して移動しますか？', { okLabel: '破棄する', danger: true });
       if (!ok) return;
     }
     setDirty(false);
@@ -280,10 +293,26 @@ function Workspace({
         return (
           <NotificationForm key="new" guild={guild} toast={toast} onDirtyChange={setDirty} onClose={backToList} onSaved={backToList} />
         );
+      case 'notif-new2':
+        return (
+          <NotificationFormV2 key="new2" guild={guild} toast={toast} onDirtyChange={setDirty} onClose={backToList} onSaved={backToList} />
+        );
       case 'notif-edit':
         return (
           <NotificationForm
             key={route.nuuid}
+            guild={guild}
+            nuuid={route.nuuid}
+            toast={toast}
+            onDirtyChange={setDirty}
+            onClose={backToList}
+            onSaved={backToList}
+          />
+        );
+      case 'notif-edit2':
+        return (
+          <NotificationFormV2
+            key={'v2-' + route.nuuid}
             guild={guild}
             nuuid={route.nuuid}
             toast={toast}
@@ -344,10 +373,15 @@ function Workspace({
         </Topbar>
         <Shell>
           <SideNav>
-            {NAV.map((n) => (
-              <NavItem key={n.key} active={sec === n.key} onClick={() => selectSection(n.key)} style={{ cursor: 'pointer' }}>
-                {n.label}
-              </NavItem>
+            {NAV_GROUPS.map((g) => (
+              <React.Fragment key={g.label}>
+                <div className="navgroup">{g.label}</div>
+                {g.items.map((n) => (
+                  <NavItem key={n.key} active={sec === n.key} onClick={() => selectSection(n.key)} style={{ cursor: 'pointer' }}>
+                    {n.label}
+                  </NavItem>
+                ))}
+              </React.Fragment>
             ))}
           </SideNav>
           <Main>
@@ -361,8 +395,8 @@ function Workspace({
                 guild={guild}
                 toast={toast}
                 onError={onError}
-                onNew={() => navigate('notifications/new')}
-                onEdit={(uuid) => navigate(`notifications/${uuid}/edit`)}
+                onNew={(v2) => navigate(v2 ? 'notifications/new2' : 'notifications/new')}
+                onEdit={(uuid, v2) => navigate(`notifications/${uuid}/${v2 ? 'edit2' : 'edit'}`)}
                 onGroupingSettings={(uuid) => navigate(`notifications/${uuid}/grouping-settings`)}
               />
             ) : sec === 'segments' ? (

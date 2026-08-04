@@ -3,7 +3,9 @@
 export type Route =
   | { kind: 'list' }
   | { kind: 'notif-new' }
+  | { kind: 'notif-new2' }
   | { kind: 'notif-edit'; nuuid: string }
+  | { kind: 'notif-edit2'; nuuid: string }
   | { kind: 'grouping-settings'; nuuid: string }
   | { kind: 'grouping'; nuuid: string; ouuid: string }
   | { kind: 'seg-members'; suuid: string };
@@ -19,7 +21,9 @@ export function routeFromRest(rest: string[]): Route {
   if (rest.length === 0) return { kind: 'list' };
   if (rest[0] === 'notifications') {
     if (rest[1] === 'new') return { kind: 'notif-new' };
+    if (rest[1] === 'new2') return { kind: 'notif-new2' };
     if (rest[2] === 'edit') return { kind: 'notif-edit', nuuid: rest[1] };
+    if (rest[2] === 'edit2') return { kind: 'notif-edit2', nuuid: rest[1] };
     if (rest[2] === 'grouping-settings') return { kind: 'grouping-settings', nuuid: rest[1] };
     if (rest[2] === 'occurrences' && rest[4] === 'grouping') {
       return { kind: 'grouping', nuuid: rest[1], ouuid: rest[3] };
@@ -32,7 +36,7 @@ export function routeFromRest(rest: string[]): Route {
 /** ルート種別 → アクティブにすべきサイドナビ（'notif-ops'|'notifications'|'segments'| null=変更不要）。 */
 export function sectionForRoute(kind: Route['kind']): string | null {
   if (kind === 'seg-members') return 'segments';
-  if (kind === 'notif-new' || kind === 'notif-edit' || kind === 'grouping-settings') return 'notifications';
+  if (kind === 'notif-new' || kind === 'notif-new2' || kind === 'notif-edit' || kind === 'notif-edit2' || kind === 'grouping-settings') return 'notifications';
   if (kind !== 'list') return 'notif-ops'; // grouping
   return null;
 }

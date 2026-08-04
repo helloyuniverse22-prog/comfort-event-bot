@@ -34,7 +34,16 @@ export function Segments({
       setSegs([]);
       toast(e instanceof Error ? e.message : String(e), true);
     }
+    // 一覧のロール pill を名前で出すため取得（失敗時は ID フォールバック・ベストエフォート）
+    if (!roles) {
+      try {
+        setRoles(await api(`/guilds/${guild.id}/roles`));
+      } catch {}
+    }
   };
+  /** ロールIDを「@ロール名」で表示（未解決は生IDフォールバック） */
+  const roleLabel = (id: string) =>
+    id === '@everyone' ? '@everyone' : roles?.some((r) => r.id === id) ? '@' + roles.find((r) => r.id === id)!.name : id;
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -90,13 +99,21 @@ export function Segments({
   };
 
   const remove = async (uuid: string) => {
-    const ok = await confirmDialog('この区分を削除します。', { danger: true, okLabel: '削除' });
+    const ok = await confirmDialog(
+      'この区分を削除します。所属メンバーの登録も解除されます（過去の回答記録は残ります）。元に戻せません。',
+      { danger: true, okLabel: '削除する' },
+    );
     if (!ok) return;
     try {
       await api('/segments/' + uuid, { method: 'DELETE' });
       toast('削除しました');
       await load();
     } catch (e) {
+      // スケジュールの対象になっている区分はサーバー側が 409 で拒否する
+      if ((e as { status?: number }).status === 409) {
+        toast('この区分はスケジュールの対象になっているため削除できません。先にスケジュール設定を変更してください。', true);
+        return;
+      }
       toast(e instanceof Error ? e.message : String(e), true);
     }
   };
@@ -141,7 +158,7 @@ export function Segments({
                 <div className="muted" style={{ fontSize: 12, marginTop: 2 }}>
                   {s.mention_role_id ? (
                     <>
-                      <span className="pill on">ロール管理</span> <span className="pill">{s.mention_role_id}</span>
+                      <span className="pill on">ロール管理</span> <span className="pill">{roleLabel(s.mention_role_id)}</span>
                     </>
                   ) : (
                     <span className="pill off">手動管理</span>
@@ -155,7 +172,7 @@ export function Segments({
                 <button className="btn sm ghost" onClick={() => openEdit(s)}>
                   編集
                 </button>
-                <button className="btn sm danger" onClick={() => remove(s.uuid)}>
+                <button className="btn sm ghost danger" onClick={() => remove(s.uuid)}>
                   削除
                 </button>
               </div>
@@ -181,16 +198,19 @@ export function Segments({
       >
         <div className="row">
           <div>
-            <label>名前</label>
+            <label>
+              名前 <span className="req">✱</span>
+            </label>
             <TextField placeholder="例: キャスト" value={name} onChange={(e) => setName(e.target.value)} />
           </div>
           <div>
-            <label>
-              ロール / @everyone（任意）<span className="muted">設定するとメンバーをこのロールから自動同期＋メンション先に</span>
-            </label>
+            <label>ロール / @everyone（任意）</label>
             <Select value={roleId} onChange={(e) => setRoleId(e.target.value)}>
               {roleOptions}
             </Select>
+            <p className="muted" style={{ fontSize: 12, margin: '6px 0 0' }}>
+              設定するとメンバーをこのロールから自動同期し、メンション先になります。
+            </p>
           </div>
         </div>
       </FormDialog>

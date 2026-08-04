@@ -12,6 +12,9 @@ export type GroupingView = {
   groups: Group[];
   pool: GroupMember[];
   diff: { no_longer_participating: { user_id: string; group_id: number }[] };
+  /** どの開催回の配置か見出しに出すための表示情報（API が同送・M4） */
+  occurrence?: { occurrence_date: string; start_time: string | null };
+  notification?: { name: string; start_time: string | null; duration_minutes: number | null } | null;
 };
 export type Constraint = {
   uuid: string;
@@ -308,7 +311,7 @@ export function mountBoard(
       <div class="grouping-toolbar">
         <label>グループ数</label>
         <input type="number" id="groupingCount" min="1" max="50" value="${groupCount}" style="width:80px" />
-        <button class="btn sm secondary" id="groupingApplyCount">グループ数を変更</button>
+        <button class="btn sm secondary" id="groupingApplyCount">${view.grouping ? 'グループ数を変更' : 'グループ枠を作成'}</button>
         <button class="btn sm secondary" id="groupingAuto" title="未割り当てメンバーをランダムに配置します（既存配置は維持）。『同じグループ（必須）』のペアはまとめますが、『別のグループに』制約は考慮しません（違反は下に警告表示）">🎲 ランダムに振り分け</button>
         <button class="btn sm ghost" id="groupingClear">クリア</button>
         <span class="spacer"></span>

@@ -151,6 +151,7 @@ export async function upsertMember(
 export async function deleteMember(db: D1Database, userId: string): Promise<boolean> {
   await db.prepare('DELETE FROM segment_members WHERE user_id = ?').bind(userId).run();
   await db.prepare('DELETE FROM responses WHERE user_id = ?').bind(userId).run();
+  await db.prepare('DELETE FROM response_log WHERE user_id = ?').bind(userId).run();
   await db.prepare('DELETE FROM member_guild_profiles WHERE user_id = ?').bind(userId).run();
   const res = await db.prepare('DELETE FROM members WHERE user_id = ?').bind(userId).run();
   return (res.meta.changes ?? 0) > 0;

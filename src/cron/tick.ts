@@ -42,6 +42,7 @@ import {
   composePost,
   listGuildMembers,
   listGuilds,
+  answerLabels,
   DISCORD_CONTENT_LIMIT,
   type GuildMemberSummary,
 } from '../discord/rest';
@@ -178,7 +179,7 @@ export async function recruitNotificationNow(
 ): Promise<{ ok: boolean; message: string }> {
   const db = env.DB;
   const segment = await getSegment(db, n.segment_id);
-  if (!segment) return { ok: false, message: `対象の区分 #${n.segment_id} が見つかりません。` };
+  if (!segment) return { ok: false, message: '対象のメンバー区分が見つかりません。管理画面でスケジュールの設定を確認してください。' };
 
   // 単発: 確定済みは確定回を、未確定は候補回（複数なら一括／1件ならそれ）を募集する。
   // 確定済みで最早でないスロットを選んだ場合に nextOccurrenceDate(=one_off_date=最早)を掴んで
@@ -191,8 +192,8 @@ export async function recruitNotificationNow(
       }
       const sentOk = await sendRecruitment(env, n, occ);
       return sentOk
-        ? { ok: true, message: `**${formatOccurrenceLabel(occ.occurrence_date, slotTime(occ, n), n.duration_minutes)}** の募集メッセージを送信しました!` }
-        : { ok: false, message: '募集メッセージの送信に失敗しました（文字数超過や Discord エラーの可能性）。' };
+        ? { ok: true, message: `**${formatOccurrenceLabel(occ.occurrence_date, slotTime(occ, n), n.duration_minutes)}** の募集メッセージを投稿しました!` }
+        : { ok: false, message: '募集メッセージの投稿に失敗しました（文字数超過や Discord エラーの可能性）。' };
     }
     const candidates = await listScheduledOccurrences(db, n.id);
     // 候補回が未生成の旧データは one_off_date から 1 件だけ補完
@@ -204,29 +205,30 @@ export async function recruitNotificationNow(
     if (live.length > 1) {
       const sent = await sendCandidateRecruitment(env, n, live);
       return sent > 0
-        ? { ok: true, message: `${live.length} 件の候補日について募集メッセージを送信しました!` }
-        : { ok: false, message: '募集メッセージの送信に失敗しました。' };
+        ? { ok: true, message: `${live.length} 件の候補日について募集メッセージを投稿しました!` }
+        : { ok: false, message: '募集メッセージの投稿に失敗しました。' };
     }
     const liveOk = await sendRecruitment(env, n, live[0]);
     return liveOk
-      ? { ok: true, message: `**${formatOccurrenceLabel(live[0].occurrence_date, slotTime(live[0], n), n.duration_minutes)}** の募集メッセージを送信しました!` }
-      : { ok: false, message: '募集メッセージの送信に失敗しました（文字数超過や Discord エラーの可能性）。' };
+      ? { ok: true, message: `**${formatOccurrenceLabel(live[0].occurrence_date, slotTime(live[0], n), n.duration_minutes)}** の募集メッセージを投稿しました!` }
+      : { ok: false, message: '募集メッセージの投稿に失敗しました（文字数超過や Discord エラーの可能性）。' };
   }
 
-  // recurring: 次回開催回を 1 件募集
+  // recurring: 次回開催回を 1 件募集（回答不要のスケジュールは表示上「告知」と呼ぶ・用語は CONTEXT.md）
+  const noun = isAnnounceOnly(n) ? '告知' : '募集';
   const target = nextOccurrenceDate(n);
   if (!target) {
-    return { ok: false, message: '次回の開催日を特定できませんでした（rrule を確認してください）。' };
+    return { ok: false, message: '次回の開催日を特定できませんでした（繰り返し設定を確認してください）。' };
   }
   // 中止の墓石照合は日付のみ（時刻無視）。start_time 変更後も中止意図を維持する。
   if (await hasCancelledOccurrenceOnDate(db, n.id, target)) {
-    return { ok: false, message: `**${target}** の開催回は中止扱いのため募集できません。` };
+    return { ok: false, message: `**${target}** の開催回は中止扱いのため${noun}できません。` };
   }
   const occ = await getOrCreateOccurrence(db, n.id, target, n.start_time);
   const recurOk = await sendRecruitment(env, n, occ);
   return recurOk
-    ? { ok: true, message: `**${formatOccurrenceLabel(occ.occurrence_date, slotTime(occ, n), n.duration_minutes)}** の募集メッセージを送信しました!` }
-    : { ok: false, message: '募集メッセージの送信に失敗しました（文字数超過や Discord エラーの可能性）。' };
+    ? { ok: true, message: `**${formatOccurrenceLabel(occ.occurrence_date, slotTime(occ, n), n.duration_minutes)}** の${noun}メッセージを投稿しました!` }
+    : { ok: false, message: `${noun}メッセージの投稿に失敗しました（文字数超過や Discord エラーの可能性）。` };
 }
 
 // =============================================================================
@@ -255,22 +257,24 @@ function quotaMessage(n: Notification, member: QuotaAlert, guildName: string): s
   );
 }
 
-/** 未回答リマインド DM 文面 */
+/** 未回答リマインド DM 文面（本文の回答語彙はボタンと同じく通知タイプで切替） */
 function unansweredMessage(n: Notification, occ: Occurrence, daysUntil: number, guildName: string): string {
   const dayText = daysUntil === 0 ? '今日' : `あと${daysUntil}日`;
+  const L = answerLabels(n.type);
   return (
     `⏰ **リマインド: ${dayText}のイベント**${guildSuffix(guildName)}\n\n` +
     `日時: **${slotLabel(occ, n)}**\n\n` +
-    `まだ回答されていません。下のボタンで参加状況を回答してください!`
+    `まだ回答されていません。下のボタンで${L.participate}/${L.absent}を回答してください!`
   );
 }
 
-/** 未定者リマインド DM 文面 */
+/** 未定者リマインド DM 文面（本文の回答語彙はボタンと同じく通知タイプで切替） */
 function undecidedMessage(n: Notification, occ: Occurrence, guildName: string): string {
+  const L = answerLabels(n.type);
   return (
     `❓ **未定者へのリマインド**${guildSuffix(guildName)}\n\n` +
     `日時: **${slotLabel(occ, n)}**\n\n` +
-    `現在「未定」で回答されています。下のボタンで参加/不参加を確定してください!`
+    `現在「${L.undecided}」で回答されています。下のボタンで${L.participate}/${L.absent}を確定してください!`
   );
 }
 
@@ -278,7 +282,7 @@ function undecidedMessage(n: Notification, occ: Occurrence, guildName: string): 
 function deadlineNoticeMessage(n: Notification, occ: Occurrence): string {
   return (
     `⏰ **回答を締め切りました**（${slotLabel(occ, n)}）\n` +
-    `以降に回答を変更すると、主催者に記録・通知されます。`
+    `以降に回答を変更すると、管理者に記録・通知されます。`
   );
 }
 
@@ -385,19 +389,9 @@ function deadlinePassed(n: Notification, occ: Occurrence, now: Date): boolean {
   return dl != null && now.getTime() >= dl.getTime();
 }
 
-/**
- * 締切告知の send_log キー。deadlinePassed は締切〜開催日まで毎ティック true になるため、
- * send_date に実行日(today)を使うと日付が変わるたび別キーになり再送される（2026-07-04 本番事故）。
- * 開催回の日付で固定し「開催回につき 1 回」を保証する。
- */
-export function deadlineNoticeKey(n: Notification, occ: Occurrence): SendKey {
-  return {
-    notification_id: n.id,
-    occurrence_id: occ.id,
-    kind: 'deadline_notice',
-    send_date: occ.occurrence_date,
-  };
-}
+// 締切告知の跨日デデュープは募集と同じ hasSentKind（send_date 無視・「開催回につき 1 回」）で行う。
+// 旧方式（send_date=開催日で固定するキー・2026-07-04 事故対応）は撤去済み。hasSentKind は
+// 旧キーで記録済みの行にもヒットするため、方式変更を跨いでも再送しない。send_date には実送信日を記録する。
 
 /**
  * 通知が daysUntil 日後の開催回に対して何か送りうるか（安価な事前判定）。
@@ -487,10 +481,17 @@ async function drainOccurrence(ctx: TickCtx, n: Notification, occ: Occurrence): 
 
   // --- (1) 締切告知（メンバー向け・締切時刻ゲート。send_hour に依存せず時刻ベースで独立発火・ADR 0014）---
   // 文面は固定（@メンションなし）だが、念のため allowed_mentions={parse:[]} で一切ピングしないことを保証。
-  if (!announceOnly && deadlinePassed(n, occ, ctx.now)) {
+  // deadlinePassed は締切〜開催日まで毎ティック true のため、hasSentKind で「開催回につき 1 回」に抑える。
+  // send_date=実送信日で記録。失敗（failed）は hasSentKind が数えないが、当日中は failed 行が
+  // claim の UNIQUE キーを塞ぐため、再送は翌日以降（募集と同じ。開催日当日の失敗はリトライされない）。
+  if (
+    !announceOnly &&
+    deadlinePassed(n, occ, ctx.now) &&
+    !(await hasSentKind(db, n.id, occ.id, 'deadline_notice'))
+  ) {
     await drainTasks(ctx, [
       {
-        key: deadlineNoticeKey(n, occ),
+        key: { notification_id: n.id, occurrence_id: occ.id, kind: 'deadline_notice', send_date: today },
         run: () => sendChannelMessage(env, n.channel_id, deadlineNoticeMessage(n, occ), null, { parse: [] }),
       },
     ]);

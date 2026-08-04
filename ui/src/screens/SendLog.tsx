@@ -8,6 +8,7 @@ import type { ToastFn } from '../App';
 type LogRow = {
   send_date?: string;
   notification_name?: string;
+  requires_response?: number;
   occurrence_date?: string;
   kind?: string;
   user_id?: string;
@@ -23,6 +24,14 @@ const KIND_LABEL: Record<string, string> = {
   quota: 'ノルマ',
   deadline_notice: '締切告知',
 };
+
+/** kind='recruit' は出欠確認の有無で「募集/告知」に表示分岐する（保存値は不変・用語は CONTEXT.md） */
+function kindLabel(r: LogRow): string {
+  if (r.kind === 'recruit') return r.requires_response === 0 ? '告知' : '募集';
+  return KIND_LABEL[r.kind || ''] || r.kind || '';
+}
+
+const STATUS_LABEL: Record<string, string> = { sent: '成功', failed: '失敗' };
 
 export function SendLog({ guild, toast }: { guild: Guild; toast: ToastFn }) {
   const [rows, setRows] = useState<LogRow[] | null>(null);
@@ -48,9 +57,9 @@ export function SendLog({ guild, toast }: { guild: Guild; toast: ToastFn }) {
 
   return (
     <>
-      <h2>リマインド送信履歴</h2>
+      <h2>送信履歴</h2>
       <p className="muted">
-        cron が送った募集・リマインド・ノルマ・締切告知の記録（直近 {rows.length} 件・このサーバー: {guild.name || guild.id}）。DM
+        募集・告知・リマインド・ノルマ・締切告知など、自動送信の記録（直近 {rows.length} 件・このサーバー: {guild.name || guild.id}）。DM
         拒否などの失敗もここで確認できます。
       </p>
       {rows.length === 0 ? (
@@ -60,13 +69,29 @@ export function SendLog({ guild, toast }: { guild: Guild; toast: ToastFn }) {
           options={{
             search: false,
             columns: [
-              { id: 'date', header: '送信日', accessor: (r: LogRow) => r.send_date || '' },
-              { id: 'notif', header: '通知', accessor: (r: LogRow) => r.notification_name || '' },
-              { id: 'occ', header: '開催日', accessor: (r: LogRow) => r.occurrence_date || '' },
-              { id: 'kind', header: '種別', accessor: (r: LogRow) => KIND_LABEL[r.kind || ''] || r.kind },
+              { id: 'date', header: '送信日', filter: 'date', accessor: (r: LogRow) => r.send_date || '' },
+              {
+                id: 'notif',
+                header: 'スケジュール',
+                filter: 'select',
+                accessor: (r: LogRow) => r.notification_name || '',
+                // スケジュール名が列幅の自動配分で毎行折り返されて読みにくいため折り返さない（M5）
+                render: (v: string) => `<span style="white-space:nowrap">${esc(v)}</span>`,
+              },
+              { id: 'occ', header: '開催日', filter: 'date', accessor: (r: LogRow) => r.occurrence_date || '' },
+              {
+                id: 'kind',
+                header: '種別',
+                filter: 'select',
+                filterOptions: ['募集', '告知', '未回答リマインド', '未定リマインド', 'ノルマ', '締切告知'],
+                accessor: (r: LogRow) => kindLabel(r),
+                // 「未回答リマインド」が列幅の自動配分で2行に折り返されるため折り返さない
+                render: (v: string) => `<span style="white-space:nowrap">${esc(v)}</span>`,
+              },
               {
                 id: 'to',
                 header: '宛先',
+                filter: 'combo',
                 accessor: (r: LogRow) => r.user_name || r.user_id || '（チャンネル）',
                 render: (_v: string, r: LogRow) =>
                   !r.user_id
@@ -78,15 +103,28 @@ export function SendLog({ guild, toast }: { guild: Guild; toast: ToastFn }) {
               {
                 id: 'status',
                 header: '結果',
-                accessor: (r: LogRow) => r.status,
+                filter: 'select',
+                filterOptions: ['成功', '失敗'],
+                accessor: (r: LogRow) => STATUS_LABEL[r.status || ''] || r.status || '',
                 render: (v: string) =>
-                  v === 'sent'
-                    ? '<span class="pill on">送信</span>'
-                    : v === 'failed'
+                  v === '成功'
+                    ? '<span class="pill on">成功</span>'
+                    : v === '失敗'
                       ? '<span class="pill" style="color:var(--danger);border-color:var(--danger)">失敗</span>'
                       : `<span class="pill">${esc(v)}</span>`,
               },
-              { id: 'error', header: '詳細', accessor: (r: LogRow) => r.error || '', render: (v: string) => (v ? `<span class="muted">${esc(v)}</span>` : '') },
+              {
+                id: 'error',
+                header: '詳細',
+                // 成功行も空欄にせず一言残す（失敗時はエラー内容＝DM拒否等の理由）
+                accessor: (r: LogRow) => r.error || (r.status === 'sent' ? '送信に成功' : r.status === 'failed' ? '送信に失敗' : ''),
+                render: (v: string, r: LogRow) =>
+                  r.status === 'failed'
+                    ? `<span style="color:var(--danger)">${esc(v)}</span>`
+                    : v
+                      ? `<span class="muted">${esc(v)}</span>`
+                      : '',
+              },
             ],
             rows,
           }}
