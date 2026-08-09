@@ -147,6 +147,22 @@ export async function getActiveSegmentMembers(
 }
 
 /**
+ * 区分内の自分 1 人分の休止状態（''=アクティブ、未所属は null）。
+ * ボタン応答の休止チェック用 — listSegmentMembers の全員 JOIN を避ける軽量版。
+ */
+export async function getSegmentMemberStatus(
+  db: D1Database,
+  segmentId: number,
+  userId: string,
+): Promise<string | null> {
+  const row = await db
+    .prepare('SELECT status FROM segment_members WHERE segment_id = ? AND user_id = ?')
+    .bind(segmentId, userId)
+    .first<{ status: string }>();
+  return row?.status ?? null;
+}
+
+/**
  * 所属追加（存在すれば no-op の upsert）。status は既存維持。
  * names（ピッカー由来のサーバー内ニック / ユーザー名）があれば members マスタへ取り込む。
  * 表示名（サーバー内ニック）はギルドごとの member_guild_profiles へ保存する（ADR 0022）。

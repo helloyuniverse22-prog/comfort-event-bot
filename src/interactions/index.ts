@@ -5,7 +5,11 @@ import pkg from '../../package.json';
 // Cloudflare Workers (workerd) は crypto.subtle.importKey('raw', ..., { name: 'Ed25519' }, ...) と
 // crypto.subtle.verify('Ed25519', ...) を 2023 年以降サポート済み。
 const InteractionType = { PING: 1, APPLICATION_COMMAND: 2, MESSAGE_COMPONENT: 3 } as const;
-const InteractionResponseType = { PONG: 1, CHANNEL_MESSAGE_WITH_SOURCE: 4 } as const;
+const InteractionResponseType = {
+  PONG: 1,
+  CHANNEL_MESSAGE_WITH_SOURCE: 4,
+  DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE: 5,
+} as const;
 
 const HEX_RE = /^[0-9a-f]+$/i;
 function hexToBytes(hex: string): Uint8Array {
@@ -44,10 +48,10 @@ import {
   getSegment,
   getActiveSegmentMembers,
   addSegmentMember,
-  listSegmentMembers,
+  getSegmentMemberStatus,
 } from '../db/segments';
 import { upsertResponse, getResponseStatus, getStatusBuckets } from '../db/responses';
-import { buildStatusMessage, buildAllStatusMessage, sendChannelMessage, answerLabels } from '../discord/rest';
+import { API, USER_AGENT, buildStatusMessage, buildAllStatusMessage, sendChannelMessage, answerLabels } from '../discord/rest';
 import { roleGateAllows } from '../discord/syncSegment';
 import { formatOccurrenceLabel, responseDeadline, getJSTNow } from '../lib/date';
 import { recruitNotificationNow } from '../cron/tick';
@@ -62,6 +66,9 @@ interface DiscordUser {
 
 interface DiscordInteraction {
   type: number;
+  /** deferred 応答後の PATCH @original（webhook 経路）に使う。全インタラクションに同梱される */
+  application_id: string;
+  token: string;
   data?: {
     name?: string;
     custom_id?: string;
@@ -91,6 +98,29 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+/**
+ * deferred 応答の後から結果を書き込む（PATCH @original）。
+ * webhook 経路のため Bot トークン不要（interaction token が認可を兼ねる）。
+ * ephemeral フラグは deferred 応答側で確定済みのため content/components のみ送る。
+ */
+async function patchOriginal(
+  interaction: DiscordInteraction,
+  res: InteractionResponse,
+): Promise<void> {
+  const url = `${API}/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`;
+  const r = await fetch(url, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
+    body: JSON.stringify({
+      content: res.data?.content ?? '',
+      components: res.data?.components ?? [],
+    }),
+  });
+  if (!r.ok) {
+    console.error('[Interaction] patch @original failed:', r.status, await r.text());
+  }
 }
 
 const STATUS_MAP: Record<string, string> = {
@@ -131,9 +161,22 @@ export async function handleInteraction(
     return json(await handleCommand(interaction, env, origin));
   }
 
-  // ボタン
+  // ボタン: D1 直列クエリ＋遅延スパイクで Discord の 3 秒制限を超えることがあるため、
+  // deferred (type 5・ephemeral) を即返しし、実処理は waitUntil で継続 → 結果を PATCH @original で書き込む。
   if (interaction.type === InteractionType.MESSAGE_COMPONENT) {
-    return json(await handleButton(interaction, env, ctx));
+    ctx.waitUntil(
+      handleButton(interaction, env, ctx)
+        .catch((e) => {
+          console.error('[Button] unhandled error:', (e as Error).message);
+          return ephemeral('❌ 処理に失敗しました。もう一度お試しください。');
+        })
+        .then((res) => patchOriginal(interaction, res))
+        .catch((e) => console.error('[Button] patch @original failed:', (e as Error).message)),
+    );
+    return json({
+      type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+      data: { flags: EPHEMERAL },
+    });
   }
 
   return json(ephemeral('このインタラクションはサポートされていません'));
@@ -396,12 +439,11 @@ async function handleButton(
     // 区分への自動所属（既存なら no-op、status は維持）。ロール管理区分でも保有者なら整合する。
     await addSegmentMember(db, { id: n.segment_id, guild_id: n.guild_id }, userId);
 
-    // 休止中なら回答拒否
-    const memberships = await listSegmentMembers(db, n.segment_id);
-    const mine = memberships.find((m) => m.user_id === userId);
-    if (mine && mine.status) {
+    // 休止中なら回答拒否（全員一覧ではなく自分の 1 行だけ引く）
+    const myStatus = await getSegmentMemberStatus(db, n.segment_id, userId);
+    if (myStatus) {
       return ephemeral(
-        `⏸️ あなたは現在「${mine.status}」に設定されているため、回答できません。\n解除はサーバーの管理者に依頼してください。`,
+        `⏸️ あなたは現在「${myStatus}」に設定されているため、回答できません。\n解除はサーバーの管理者に依頼してください。`,
       );
     }
 

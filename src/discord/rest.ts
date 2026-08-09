@@ -3,7 +3,7 @@ import type { Member, EventStatusBuckets, MentionMode, NotificationType, Segment
 import { setDmChannelId } from '../db/members';
 import pkg from '../../package.json';
 
-const API = 'https://discord.com/api/v10';
+export const API = 'https://discord.com/api/v10';
 /** Discord API への User-Agent（バージョンは package.json から取得）。コマンド登録でも共用。 */
 export const USER_AGENT = `DiscordBot (https://github.com/taki98029/discord-event-bot, ${pkg.version})`;
 

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { verifyEd25519 } from '../src/interactions/index';
+import { verifyEd25519, handleInteraction } from '../src/interactions/index';
+import type { Env } from '../src/env';
 
 function bytesToHex(bytes: Uint8Array): string {
   return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -47,5 +48,53 @@ describe('verifyEd25519 (Discord Interaction 署名検証)', () => {
   it('署名フォーマット不正 → false (throw しない)', async () => {
     const { publicKeyHex } = await makeKeyPair();
     expect(await verifyEd25519('body', 'zz', '0', publicKeyHex)).toBe(false);
+  });
+});
+
+describe('handleInteraction — ボタンは deferred (type 5) を即返す', () => {
+  it('MESSAGE_COMPONENT → 即時 type 5 (ephemeral) + waitUntil で PATCH @original', async () => {
+    const { publicKeyHex, privateKey } = await makeKeyPair();
+    // custom_id に区切り '_' 無し → occurrenceId NaN → DB を触らず早期 ephemeral エラーで返る経路
+    const body = JSON.stringify({
+      type: 3,
+      application_id: 'app123',
+      token: 'tok456',
+      data: { custom_id: 'garbage' },
+      member: { user: { id: 'u1', username: 'alice' } },
+    });
+    const ts = '1700000000';
+    const sig = await sign(privateKey, ts, body);
+    const request = new Request('https://example.com/interactions', {
+      method: 'POST',
+      headers: { 'x-signature-ed25519': sig, 'x-signature-timestamp': ts },
+      body,
+    });
+
+    const tasks: Promise<unknown>[] = [];
+    const ctx = {
+      waitUntil: (p: Promise<unknown>) => tasks.push(p),
+    } as unknown as Parameters<typeof handleInteraction>[2];
+
+    const patches: { url: string; body: string }[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      patches.push({ url: String(url), body: String(init?.body) });
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch;
+    try {
+      const res = await handleInteraction(request, { DISCORD_PUBLIC_KEY: publicKeyHex } as Env, ctx);
+      expect(await res.json()).toEqual({ type: 5, data: { flags: 64 } });
+
+      // 実処理は waitUntil に 1 件だけ積まれ、完了後に PATCH @original が飛ぶ
+      expect(tasks).toHaveLength(1);
+      await Promise.all(tasks);
+      expect(patches).toHaveLength(1);
+      expect(patches[0].url).toBe(
+        'https://discord.com/api/v10/webhooks/app123/tok456/messages/@original',
+      );
+      expect(JSON.parse(patches[0].body).content).toContain('不正なインタラクション');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 });
