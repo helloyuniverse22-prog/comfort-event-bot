@@ -1,6 +1,6 @@
 // スケジュールフォームの「募集/告知メッセージ簡易プレビュー」と「送信タイムライン整合性チェック」。
 // 旧 buildRecruitPreviewText()/notifPreview() の純関数移植（DOM 非依存）。
-import { nextWeekdayDates, wdLabel, type RepeatMode } from './rrule';
+import { nextBiweeklyFromAnchor, nextWeekdayDates, wdLabel, type RepeatMode } from './rrule';
 
 export type PreviewInput = {
   title: string;
@@ -8,6 +8,8 @@ export type PreviewInput = {
   mode: RepeatMode;
   startTime: string;
   weekday: string;
+  /** 隔週の起点日 'YYYY/MM/DD'（あればパリティを反映した次回日を表示） */
+  biweeklyAnchor?: string;
   duration: number | null;
   deadlineHours: number | null;
   mention: 'role' | 'members' | 'none';
@@ -36,10 +38,17 @@ export function buildRecruitPreviewParts(v: PreviewInput): PreviewParts {
       dateObj = dates[0];
     }
   } else if (v.mode === 'biweekly' && v.weekday) {
-    const dates = nextWeekdayDates(v.weekday, 1);
-    if (dates.length) {
-      dateStr = `${dates[0]} (${wdLabel(v.weekday)}・隔週パリティは投稿時に確定)`;
-      dateObj = dates[0];
+    const anchored = v.biweeklyAnchor ? nextBiweeklyFromAnchor(v.biweeklyAnchor) : null;
+    if (anchored) {
+      const [y, m, d] = anchored.split('/').map(Number);
+      dateStr = `${anchored} (${'日月火水木金土'[new Date(y, m - 1, d).getDay()]}・隔週)`;
+      dateObj = anchored;
+    } else {
+      const dates = nextWeekdayDates(v.weekday, 1);
+      if (dates.length) {
+        dateStr = `${dates[0]} (${wdLabel(v.weekday)}・隔週パリティは投稿時に確定)`;
+        dateObj = dates[0];
+      }
     }
   } else if (v.mode === 'monthly') {
     dateStr = '(月次ルールで計算される開催日)';

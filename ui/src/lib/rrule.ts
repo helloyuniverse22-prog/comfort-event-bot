@@ -104,6 +104,27 @@ export function nextWeekdayDates(code: string, count: number): string[] {
   return out;
 }
 
+/** 起点日('YYYY/MM/DD')の曜日が選択曜日コードと一致するか（不正な日付は false） */
+export function anchorMatchesWeekday(anchor: string, code: string): boolean {
+  const [y, m, d] = (anchor || '').split('/').map(Number);
+  return !!y && !!m && !!d && new Date(y, m - 1, d).getDay() === WEEKDAYS.findIndex((w) => w[0] === code);
+}
+
+/**
+ * 隔週の次回開催日: 起点日('YYYY/MM/DD')から14日刻みで today 以降の最初の日。
+ * 起点が未来ならそのまま返す。不正な起点は null（呼び出し側でフォールバック）。
+ * サーバ nextOccurrenceDates の anchor パリティと同等（日粒度・当日 start_time 境界は近似）。
+ */
+export function nextBiweeklyFromAnchor(anchor: string, today: Date = new Date()): string | null {
+  const [y, m, d] = (anchor || '').split('/').map(Number);
+  if (!y || !m || !d) return null;
+  const t = new Date(y, m - 1, d);
+  const base = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const diff = base.getTime() - t.getTime();
+  if (diff > 0) t.setDate(t.getDate() + Math.ceil(diff / (14 * 86_400_000)) * 14);
+  return fmtDate(t);
+}
+
 function addMinsToTime(time: string, minutes: number): { time: string; nextDay: boolean } {
   const [h, m] = (time || '0:0').split(':').map(Number);
   const total = (h || 0) * 60 + (m || 0) + minutes;

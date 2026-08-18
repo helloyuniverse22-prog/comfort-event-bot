@@ -11,8 +11,10 @@ import { buildRecruitPreviewParts, notifPreviewSummary } from '../lib/notifPrevi
 import {
   NTH,
   WEEKDAYS,
+  anchorMatchesWeekday,
   buildRRule,
   dedupeMonthlyRules,
+  nextBiweeklyFromAnchor,
   nextWeekdayDates,
   parseRRuleToBuilder,
   scheduleSummary,
@@ -200,9 +202,12 @@ export function NotificationFormV2({
     return biweeklyAnchor && !dates.includes(biweeklyAnchor) ? [biweeklyAnchor, ...dates] : dates;
   }, [weekday, biweeklyAnchor]);
 
-  // 隔週へ切替時に起点未選択なら直近日を既定にする（空のまま保存させない）
+  // 隔週へ切替時・曜日変更時: 起点が未選択または曜日不一致なら直近日に取り直す
+  // （曜日を後から変えると旧曜日の起点が残り、表示・保存パリティが狂うため）
   useEffect(() => {
-    if (mode === 'biweekly' && !biweeklyAnchor && biweeklyOptions.length) setBiweeklyAnchor(biweeklyOptions[0]);
+    if (mode !== 'biweekly' || anchorMatchesWeekday(biweeklyAnchor, weekday)) return;
+    const dates = nextWeekdayDates(weekday, 1);
+    if (dates.length) setBiweeklyAnchor(dates[0]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, weekday]);
 
@@ -225,6 +230,7 @@ export function NotificationFormV2({
     mode,
     startTime,
     weekday,
+    biweeklyAnchor,
     duration: durationNum,
     deadlineHours: deadlineNum,
     mention,
@@ -245,7 +251,11 @@ export function NotificationFormV2({
   const shNum = Number(sendHour);
   const [evH, evM] = (startTime || '21:00').split(':').map((x) => Number(x) || 0);
   const exampleEventDate =
-    (mode === 'weekly' || mode === 'biweekly') && weekday ? (nextWeekdayDates(weekday, 1)[0] ?? null) : null;
+    mode === 'biweekly' && biweeklyAnchor
+      ? nextBiweeklyFromAnchor(biweeklyAnchor)
+      : (mode === 'weekly' || mode === 'biweekly') && weekday
+        ? (nextWeekdayDates(weekday, 1)[0] ?? null)
+        : null;
   const fmtDt = (d: Date) =>
     `${d.getMonth() + 1}/${d.getDate()}(${WD_JP[d.getDay()]}) ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   const whenDay = (days: number | null): string => {

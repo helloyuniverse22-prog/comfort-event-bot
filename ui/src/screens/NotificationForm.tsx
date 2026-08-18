@@ -9,6 +9,7 @@ import { buildRecruitPreviewText, notifPreviewSummary } from '../lib/notifPrevie
 import {
   NTH,
   WEEKDAYS,
+  anchorMatchesWeekday,
   buildRRule,
   dedupeMonthlyRules,
   nextWeekdayDates,
@@ -179,6 +180,15 @@ export function NotificationForm({
     return biweeklyAnchor && !dates.includes(biweeklyAnchor) ? [biweeklyAnchor, ...dates] : dates;
   }, [weekday, biweeklyAnchor]);
 
+  // 隔週へ切替時・曜日変更時: 起点が未選択または曜日不一致なら直近日に取り直す
+  // （未選択のまま保存すると select の見た目と保存値(null)がズレ、パリティが不定になるため）
+  useEffect(() => {
+    if (mode !== 'biweekly' || anchorMatchesWeekday(biweeklyAnchor, weekday)) return;
+    const dates = nextWeekdayDates(weekday, 1);
+    if (dates.length) setBiweeklyAnchor(dates[0]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, weekday]);
+
   const durationNum = duration.trim() === '' ? null : Number(duration);
   const deadlineNum = deadlineHours.trim() === '' ? null : Number(deadlineHours);
   const scheduleText = scheduleSummary({
@@ -204,6 +214,7 @@ export function NotificationForm({
     mode,
     startTime,
     weekday,
+    biweeklyAnchor,
     duration: durationNum,
     deadlineHours: deadlineNum,
     mention,
