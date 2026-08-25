@@ -47,7 +47,11 @@ export interface SegmentMember extends Member {
   status: string;
 }
 
-export type NotificationType = 'recurring' | 'oneoff';
+/**
+ * 旧 'oneoff'（単発・日程調整）は 2026-08-23 に廃止し不定期（rrule=NULL）へ吸収（migration 0023・ADR 0025）。
+ * 列 `type` は残るが値は 'recurring' のみ。
+ */
+export type NotificationType = 'recurring';
 
 /**
  * メンション方法（ADR 0010）。投稿が対象者をどう名指すか。
@@ -67,13 +71,14 @@ export interface Notification {
   name: string;
   channel_id: string;
   type: NotificationType;
-  /** recurring 用 RFC5545 RRULE 文字列 */
-  rrule: string | null;
-  /** oneoff 用 'YYYY/MM/DD' */
-  one_off_date: string | null;
   /**
-   * recurring の系列基準（隔週パリティ決定用の dtstart 起点・'YYYY/MM/DD'・null可）。
-   * UI では「次回の開催日」候補として提示する（「基準日」表記は廃語・ADR 0007）。
+   * 繰り返しルール（RFC5545 RRULE のサブセット文法・src/lib/rruleGrammar.ts・正規化済み）。
+   * **NULL = 不定期**（ルールなし。開催回は運用者が開催回タブで追加した行だけ）。
+   */
+  rrule: string | null;
+  /**
+   * 「次回の開催日」'YYYY/MM/DD'。間隔 ≥ 2（隔週・隔月・N 日おき等）の位相基準で、ルールの開催日でなければならない。
+   * 間隔 1 と不定期では NULL（API が NULL に正規化）。評価の扱いは src/lib/recurrence.ts 冒頭を参照。
    */
   anchor_date: string | null;
   /** 'HH:MM'（JST） */
@@ -86,6 +91,14 @@ export interface Notification {
   recruit_days_before: number;
   remind_start_days: number;
   remind_undecided_days: number;
+  /**
+   * 配信の流れの工程スイッチ（0/1・ADR 0026）。0 でもその日数は保持する（ON に戻すと復帰）。
+   * recruit_enabled=0: 募集/告知を自動投稿しない（📣 今すぐ募集／/notify で手動投稿。ノルマ督促も送られない）
+   * remind_unanswered_enabled=0 / remind_undecided_enabled=0: そのリマインド DM を送らない
+   */
+  recruit_enabled: number;
+  remind_unanswered_enabled: number;
+  remind_undecided_enabled: number;
   /** 0/1 */
   quota_enabled: number;
   quota_interval_days: number | null;
@@ -101,8 +114,8 @@ export interface Notification {
   /** メンション方法（ADR 0010）。'none' | 'role' | 'members' */
   mention_mode: MentionMode;
   /**
-   * recurring が出欠回答を集めるか（0/1）。0=回答不要（通知のみ・ボタンなし）で、
-   * 未回答/未定リマインド・ノルマ・番号割り当ては対象外。oneoff は常に 1（ADR 0010）。
+   * 出欠回答を集めるか（0/1）。0=回答不要（告知のみ・ボタンなし）で、
+   * 未回答/未定リマインド・ノルマ・番号割り当ては対象外（ADR 0010）。
    */
   requires_response: number;
   /** 投稿の見出し（必須・1 行）。チャンネルへの募集/告知投稿の1行目に **太字** で出る（ADR 0010）。 */
@@ -111,11 +124,6 @@ export interface Notification {
   message_body: string | null;
   /** 0/1 */
   active: number;
-  /**
-   * 単発・複数候補日で確定した開催回の id（occurrences.id）。NULL=未確定。
-   * 確定すると当該回以外の候補は cancelled になり、cron はこの回のみを対象にする。
-   */
-  decided_occurrence_id: number | null;
   /**
    * 回答締切（ADR 0014）。開催開始の N 時間前を「これ以降は変更しないで」の境界とする。
    * NULL=締切なし。締切後の Response 変更（未回答→回答含む）を検知して通知し、回答履歴で識別する。
@@ -133,19 +141,21 @@ export interface Notification {
   created_at: string;
 }
 
-/** 通知一覧表示用に集計列を付与した行（候補数・確定回の日時）。一覧クエリのみで返す。 */
+/** 一覧表示用に集計列を付与した行。一覧クエリのみで返す。 */
 export interface NotificationListItem extends Notification {
-  /** status='scheduled' の occurrences 件数（単発の候補数。確定後は1） */
-  candidate_count: number;
-  /** decided_occurrence_id の開催日（未確定は null） */
-  decided_date: string | null;
-  /** decided_occurrence_id の開始時刻（未確定は null） */
-  decided_time: string | null;
+  /** 今日以降で最も近い予定（scheduled）の開催回の日付 'YYYY/MM/DD'。無ければ null（不定期の「次回 M/D」表示用） */
+  next_occurrence_date: string | null;
 }
 
 export type OccurrenceStatus = 'scheduled' | 'cancelled';
 
-/** occurrences: Notification の 1 開催回（単発の複数候補では「日付＋時刻」のスロット1つ） */
+/**
+ * 開催回の由来（migration 0023）。'rule'=RRULE から実体化（ロールフォワード・仮想行の実体化）／
+ * 'manual'=運用者が追加（臨時回・不定期の開催回）。ルール変更時に自動削除されるのは rule の未投稿行だけ。
+ */
+export type OccurrenceOrigin = 'rule' | 'manual';
+
+/** occurrences: Notification の 1 開催回（「日付＋開始時刻」のスロット1つ） */
 export interface Occurrence {
   id: number;
   /** URL／API 表面用の UUID（ADR 0016）。内部結合は id を使う */
@@ -156,6 +166,7 @@ export interface Occurrence {
   /** 'HH:MM'（JST）。このスロットの開始時刻。空文字は通知の start_time で補完して表示 */
   start_time: string;
   status: OccurrenceStatus;
+  origin: OccurrenceOrigin;
   /** 補足メッセージ（臨時回のコラボ説明など）。募集の本文と日時行の間に差し込む。NULL=なし */
   note: string | null;
   created_at: string;
@@ -193,9 +204,9 @@ export function resolveDisplayName(m: Member): string {
 }
 
 // ponytail: (b) 既存の tick/admin に散らばる「回答不要」判定を 1 本化（ADR 0010）。
-/** 回答不要（通知のみ）か。recurring かつ requires_response=0 のとき true。 */
-export function isAnnounceOnly(n: Pick<Notification, 'type' | 'requires_response'>): boolean {
-  return n.type === 'recurring' && !n.requires_response;
+/** 回答不要（告知のみ）か。requires_response=0 のとき true。 */
+export function isAnnounceOnly(n: Pick<Notification, 'requires_response'>): boolean {
+  return !n.requires_response;
 }
 
 /**

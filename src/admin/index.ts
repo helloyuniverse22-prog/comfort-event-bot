@@ -1,5 +1,5 @@
 import type { Env } from '../env';
-import type { MentionMode, NotificationType } from '../db/types';
+import type { MentionMode, OccurrenceOrigin } from '../db/types';
 import { isAnnounceOnly } from '../db/types';
 import { listGuilds, listGuildChannels, listGuildMembers, listGuildRoles, leaveGuild } from '../discord/rest';
 import {
@@ -27,8 +27,6 @@ import {
   updateNotification,
   deleteNotification,
   setGroupingChannel,
-  decideOccurrence,
-  undecideNotification,
   type NotificationInput,
 } from '../db/notifications';
 import {
@@ -38,10 +36,11 @@ import {
   setOccurrenceStatus,
   updateOccurrenceDate,
   listOccurrencesForNotification,
-  syncCandidateOccurrences,
-  type CandidateSlot,
+  pruneRuleOccurrences,
 } from '../db/occurrences';
-import { nextOccurrenceDates } from '../lib/recurrence';
+import { anchorMatchesRule, nextOccurrenceDates, type RecurrenceSpec } from '../lib/recurrence';
+import { flowWarnings } from '../lib/flowRules';
+import { formatRule, normalizeRule, parseRule } from '../lib/rruleGrammar';
 import { getResponsesForOccurrence, getStatusBuckets, listRecentResponses } from '../db/responses';
 import {
   getGroupingView,
@@ -59,11 +58,11 @@ import {
   autoAssign,
 } from '../db/groupings';
 import type { ConstraintDirection, ConstraintStrength, GroupingView } from '../db/types';
-import { claimSend, finishSend, hasSentKind, listSendLog, reclaimFailedSend, reclaimSentSend } from '../db/sendLog';
+import { hasSentKind, listSendLog } from '../db/sendLog';
 import { getAttendanceReport } from '../db/reports';
 import { getAllConfig, setConfig, getSendBudget, OCC_ROLLFORWARD_KEY } from '../db/config';
-import { sendChannelMessage, createButtonComponents } from '../discord/rest';
-import { recruitNotificationNow, sendRecruitment } from '../cron/tick';
+import { sendChannelMessage } from '../discord/rest';
+import { recruitOccurrenceNow } from '../cron/tick';
 import { formatDate, formatOccurrenceLabel, getJSTNow } from '../lib/date';
 import { getSetupStatus, registerCommandsForEnv } from './setup';
 
@@ -86,35 +85,9 @@ function num(v: unknown, def: number): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 }
-
-/**
- * 単発(oneoff)の候補スロット（日付＋時刻）を正規化する。
- * body.candidate_slots（[{date,time}]・date は 'YYYY-MM-DD'/'YYYY/MM/DD'）を
- * 'YYYY/MM/DD'＋'HH:MM' に統一し、(date,time) で重複除去・昇順ソート。
- * 未指定なら後方互換で単一 (one_off_date, start_time) を 1 スロットとして使う。
- */
-function candidateSlotsOf(
-  b: Record<string, unknown>,
-  fallbackDate: string | null,
-  fallbackTime: string,
-): CandidateSlot[] {
-  const raw = Array.isArray(b.candidate_slots) ? (b.candidate_slots as unknown[]) : [];
-  const seen = new Set<string>();
-  const out: CandidateSlot[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') continue;
-    const rec = item as Record<string, unknown>;
-    const date = typeof rec.date === 'string' ? rec.date.replace(/-/g, '/').trim() : '';
-    const time = typeof rec.time === 'string' ? rec.time.trim() : '';
-    if (!date || !time) continue;
-    const k = `${date} ${time}`;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push({ date, time });
-  }
-  out.sort((a, z) => (a.date === z.date ? a.time.localeCompare(z.time) : a.date.localeCompare(z.date)));
-  if (out.length) return out;
-  return fallbackDate ? [{ date: fallbackDate, time: fallbackTime || '21:00' }] : [];
+/** 0/1 フラグ。未指定（旧クライアント・省略）は def。 */
+function flag(v: unknown, def: 0 | 1): 0 | 1 {
+  return v == null ? def : v ? 1 : 0;
 }
 
 /** 定数時間比較（トークン照合） */
@@ -196,26 +169,26 @@ export function applyBoardStateToView(
   view.pool = poolUserIds.map((uid) => ({ user_id: uid, name: nameOf.get(uid) ?? uid }));
 }
 
-/** Notification の入力ボディを正規化（数値フラグは 0/1） */
+/**
+ * Notification の入力ボディを正規化（数値フラグは 0/1）。rrule/anchor_date は生値のまま入れ、
+ * 文法検証・正規化は validateRecurrence で行う（呼び出し側が 400 判定）。
+ */
 function toNotificationInput(b: Record<string, unknown>): NotificationInput | null {
   const guild_id = typeof b.guild_id === 'string' ? b.guild_id : '';
   const segment_id = Number(b.segment_id);
   const name = typeof b.name === 'string' ? b.name : '';
   const channel_id = typeof b.channel_id === 'string' ? b.channel_id : '';
-  const type = (b.type === 'oneoff' ? 'oneoff' : 'recurring') as NotificationType;
   if (!guild_id || !segment_id || !name || !channel_id) return null;
-  // 回答要否は recurring 専用。oneoff は常に回答あり（1）。回答不要(=通知のみ)は回答依存機能を無効化する。
-  const requiresResponse =
-    type === 'oneoff' ? 1 : b.requires_response === undefined ? 1 : b.requires_response ? 1 : 0;
-  const announceOnly = isAnnounceOnly({ type, requires_response: requiresResponse });
+  // 回答不要(=告知のみ)は回答依存機能を無効化する。
+  const requiresResponse = b.requires_response === undefined ? 1 : b.requires_response ? 1 : 0;
+  const announceOnly = isAnnounceOnly({ requires_response: requiresResponse });
   return {
     guild_id,
     segment_id,
     name,
     channel_id,
-    type,
+    type: 'recurring',
     rrule: b.rrule == null || b.rrule === '' ? null : String(b.rrule),
-    one_off_date: b.one_off_date == null || b.one_off_date === '' ? null : String(b.one_off_date),
     anchor_date: b.anchor_date == null || b.anchor_date === '' ? null : String(b.anchor_date),
     start_time: typeof b.start_time === 'string' && b.start_time ? b.start_time : '21:00',
     duration_minutes:
@@ -229,11 +202,12 @@ function toNotificationInput(b: Record<string, unknown>): NotificationInput | nu
     remind_start_days: num(b.remind_start_days, 3),
     // 負値は daysUntil と一致せず未定リマインドが無音化するため 0 以上にクランプ（0=当日）。
     remind_undecided_days: Math.max(0, num(b.remind_undecided_days, 1)),
-    // ノルマ（参加間隔の督促）は繰り返し開催のための概念。単発(oneoff)では無効に固定し、
-    // cron 自動募集を廃止した単発でノルマDMが沈黙する不整合（旧挙動からの回帰）を防ぐ。
-    quota_enabled: type === 'oneoff' ? 0 : b.quota_enabled ? 1 : 0,
+    // 工程スイッチ（ADR 0026）。省略時は 1＝従来どおり自動で行う
+    recruit_enabled: flag(b.recruit_enabled, 1),
+    remind_unanswered_enabled: flag(b.remind_unanswered_enabled, 1),
+    remind_undecided_enabled: flag(b.remind_undecided_enabled, 1),
+    quota_enabled: b.quota_enabled ? 1 : 0,
     quota_interval_days:
-      type === 'oneoff' ||
       b.quota_interval_days == null ||
       b.quota_interval_days === '' ||
       !Number.isFinite(Number(b.quota_interval_days))
@@ -273,6 +247,65 @@ function toNotificationInput(b: Record<string, unknown>): NotificationInput | nu
   };
 }
 
+const RRULE_UNREADABLE = '繰り返し設定を読み取れません。設定し直してください。';
+const ANCHOR_MISMATCH = '次回の開催日が繰り返しの設定と一致しません。';
+
+/**
+ * 繰り返し設定の検証と正規化（docs/dev/schedule-recurrence-redesign.md §5.1-5.2）。
+ * - rrule: null＝不定期。文法外（UNTIL/COUNT・未知キー・BYDAY＋BYMONTHDAY 併存など）は拒否。受理した値は正規形に書き換える。
+ * - anchor_date（次回の開催日）: 間隔 ≥ 2 のときだけ意味を持ち、与えられたらルールの開催日であること。
+ *   間隔 1 と不定期では null に正規化する（評価で無視される値を残さない）。
+ * @returns エラー文言（400 用）。OK なら null
+ */
+function validateRecurrence(input: NotificationInput): string | null {
+  if (input.rrule === null) {
+    input.anchor_date = null;
+    return null;
+  }
+  const normalized = normalizeRule(input.rrule);
+  if (!normalized) return RRULE_UNREADABLE;
+  input.rrule = normalized;
+  if (parseRule(normalized)!.interval === 1) {
+    input.anchor_date = null;
+    return null;
+  }
+  if (input.anchor_date && !anchorMatchesRule(normalized, input.anchor_date)) return ANCHOR_MISMATCH;
+  return null;
+}
+
+/**
+ * 配信の流れの検証（flow-settings-spec §3-4・2026-08-24）。定期（rrule ≠ NULL）のみ保存不可:
+ * ①手動投稿は不定期専用・順序ルール E1〜E6 違反は 400。不定期は UI 警告のみで受理する。
+ */
+function validateFlow(input: NotificationInput): string | null {
+  if (input.rrule === null) {
+    // 不定期はリマインド・締切を持たない（migration 0025 と同じ正規化・DB の不変条件）。
+    // 配信設定は「募集/告知の自動/手動」だけ。ノルマは保存値を保持（手動時は cron が募集日ごと送らない）。
+    input.remind_unanswered_enabled = 0;
+    input.remind_undecided_enabled = 0;
+    input.response_deadline_hours = null;
+    return null;
+  }
+  if (!input.recruit_enabled) return '定期のスケジュールでは「募集を投稿」を手動にできません（手動投稿は不定期でのみ選べます）。';
+  const issues = flowWarnings({
+    requireResponse: !!input.requires_response,
+    sendHour: input.send_hour,
+    startTime: input.start_time,
+    recruitDays: input.recruit_days_before,
+    remindStartDays: input.remind_unanswered_enabled ? input.remind_start_days : null,
+    remindUndecidedDays: input.remind_undecided_enabled ? input.remind_undecided_days : null,
+    deadlineHours: input.response_deadline_hours,
+  });
+  return issues.length ? `配信の流れに保存できない設定があります: ${issues[0].head}。${issues[0].detail}` : null;
+}
+
+/** 「ルールが変わったか」の比較キー（正規形 rrule・有効な anchor・start_time）。既存行の古い anchor の差は無視する。 */
+function recurrenceKey(x: RecurrenceSpec): string {
+  const rrule = normalizeRule(x.rrule);
+  const model = rrule ? parseRule(rrule) : null;
+  return JSON.stringify([rrule, model && model.interval >= 2 ? x.anchor_date ?? null : null, x.start_time]);
+}
+
 /**
  * 管理 API（/api/admin/*）。すべて ADMIN_TOKEN による Bearer 認証必須。すべて JSON。
  * - GET        /setup/status                  (シークレット有無・Interaction URL)
@@ -284,13 +317,11 @@ function toNotificationInput(b: Record<string, unknown>): NotificationInput | nu
  * - PUT/DELETE /segments/:id/members/:userId  ({status} for PUT)
  * - GET/POST   /members,                      DELETE /members/:userId
  * - GET/POST   /notifications[?guild_id=],    GET/PUT/DELETE /notifications/:id
- *              （POST/PUT で type='oneoff' は body.candidate_dates[] を候補回として同期）
+ *              （rrule は文法検証＋正規化・null=不定期。PUT はルール変更時に未投稿のルール回を掃除し {ok,pruned,kept_posted}）
+ * - POST       /notifications/preview-plan    ({rrule,anchor_date?,start_time,count?} → {dates,anchor_candidates,error?}・DB 非依存)
  * - GET        /notifications/:id/occurrences
- * - POST       /notifications/:id/occurrences ({date,start_time?,status?} 日付指定で実体化・中止墓石/臨時回)
+ * - POST       /notifications/:id/occurrences ({date,start_time?,status?,note?,origin?} 日付指定で実体化・中止墓石/臨時回)
  * - GET        /notifications/:id/plan        (未実体化の未来開催日を RRULE から導出)
- * - POST       /notifications/:id/decide      ({occurrence_id} 最終確定・他候補を cancel)
- * - POST       /notifications/:id/undecide    (確定解除・落選候補を復活)
- * - POST       /notifications/:id/recruit     (今すぐ募集を投稿)
  * - PUT        /occurrences/:id               ({status|date})
  * - POST       /occurrences/:id/recruit       (単一開催回の即時募集・send_log 記録つき)
  * - GET        /occurrences/:id/responses,    GET /occurrences/:id/status (集計バケット)
@@ -512,23 +543,38 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
         const input = toNotificationInput(body);
         if (!input) return json({ error: 'Invalid body' }, 400);
         if (!input.message_title) return json({ error: '見出しは必須です。' }, 400);
-        if (input.type === 'recurring' && !input.rrule) {
-          return json({ error: '繰り返しは曜日/第N曜ルールが必須です。' }, 400);
-        }
-        if (input.type === 'oneoff') {
-          const slots = candidateSlotsOf(body, input.one_off_date, input.start_time);
-          if (slots.length === 0) return json({ error: '単発は候補日時が必須です' }, 400);
-          input.one_off_date = slots[0].date;
-          input.start_time = slots[0].time;
-          const created = await createNotification(db, input);
-          await syncCandidateOccurrences(db, created.id, slots);
-          return json(created, 201);
-        }
+        const rerr = validateRecurrence(input);
+        if (rerr) return json({ error: rerr }, 400);
+        const ferr = validateFlow(input);
+        if (ferr) return json({ error: ferr }, 400);
         const created = await createNotification(db, input);
-        // 次ティックの日次ロールフォワードで次回開催回を即時実体化させる（rrule 実体化は 1 日 1 回集約）。
+        // 次ティックの日次ロールフォワードで窓内のルール回を即時実体化させる（rrule 実体化は 1 日 1 回集約）。
         await setConfig(db, OCC_ROLLFORWARD_KEY, '');
         return json(created, 201);
       }
+    }
+    // 繰り返しプレビュー（DB 非依存）: フォームの「次の開催日」と「次回の開催日」候補を cron と同じ関数で計算する。
+    if (path === '/notifications/preview-plan' && method === 'POST') {
+      const b = (await request.json()) as { rrule?: unknown; anchor_date?: unknown; start_time?: unknown; count?: unknown };
+      const rrule = typeof b.rrule === 'string' ? normalizeRule(b.rrule) : null;
+      if (!rrule) return json({ dates: [], anchor_candidates: [], error: RRULE_UNREADABLE });
+      const start_time = typeof b.start_time === 'string' && b.start_time ? b.start_time : '21:00';
+      const anchor_date = typeof b.anchor_date === 'string' && b.anchor_date ? b.anchor_date : null;
+      const count = Math.min(50, parseLimit(b.count == null ? null : String(b.count), 8));
+      const model = parseRule(rrule)!;
+      let anchor_candidates: string[] = [];
+      if (model.interval >= 2) {
+        // 候補＝位相を決める前の「ルールに当たる直近の日」。間隔 1 で評価し interval ×（1 周期あたりの回数）件。
+        // ponytail: 第5週の無い月などで厳密な interval 周期ぶんより少し多く出ることがある（候補が増えるだけ）。
+        const perCycle = Math.max(1, model.byday.length + model.bymonthday.length);
+        const every: RecurrenceSpec = { rrule: formatRule({ ...model, interval: 1 }), anchor_date: null, start_time };
+        anchor_candidates = nextOccurrenceDates(every, model.interval * perCycle);
+        if (anchor_date && !anchorMatchesRule(rrule, anchor_date)) {
+          return json({ dates: [], anchor_candidates, error: ANCHOR_MISMATCH });
+        }
+      }
+      const spec: RecurrenceSpec = { rrule, anchor_date: model.interval >= 2 ? anchor_date : null, start_time };
+      return json({ dates: nextOccurrenceDates(spec, count), anchor_candidates });
     }
     // /notifications/:uuid/occurrences
     const notifOccs = path.match(new RegExp(`^/notifications/(${UUID_RE})/occurrences$`));
@@ -548,6 +594,7 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
         start_time?: string;
         status?: string;
         note?: string;
+        origin?: string;
       };
       if (typeof b.date !== 'string' || !/^\d{4}\/\d{2}\/\d{2}$/.test(b.date)) {
         return json({ error: 'date (YYYY/MM/DD) required' }, 400);
@@ -559,7 +606,10 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
       const time = typeof b.start_time === 'string' ? b.start_time : n.start_time;
       // 補足メッセージ（任意）。空白のみは「なし」に正規化し、message_body と同様に上限を切る。
       const note = typeof b.note === 'string' && b.note.trim() ? b.note.trim().slice(0, 500) : null;
-      const occ = await getOrCreateOccurrence(db, n.id, b.date, time);
+      // origin: 'rule'=配信予定（RRULE 導出の仮想行）の実体化 / 'manual'（既定）=臨時回・不定期の開催回。
+      // ルール変更時に自動削除されるのは rule の未投稿行だけ（§5.3）。
+      const origin: OccurrenceOrigin = b.origin === 'rule' ? 'rule' : 'manual';
+      const occ = await getOrCreateOccurrence(db, n.id, b.date, time, origin);
       if (occ.status !== status) await setOccurrenceStatus(db, occ.id, status);
       if (note !== null) await setOccurrenceNote(db, occ.id, note);
       return json({ ...occ, status, note: note ?? occ.note }, 201);
@@ -569,7 +619,6 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
     if (notifPlan && method === 'GET') {
       const n = await getNotificationByUuid(db, notifPlan[1]);
       if (!n) return json({ error: 'Not found' }, 404);
-      if (n.type !== 'recurring') return json([]);
       const count = parseLimit(url.searchParams.get('count'), 8);
       const dates = nextOccurrenceDates(n, count);
       const existing = await listOccurrencesForNotification(db, n.id, 200);
@@ -577,47 +626,6 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
       return json(
         dates.filter((d) => !taken.has(d)).map((d) => ({ occurrence_date: d, start_time: n.start_time })),
       );
-    }
-    // /notifications/:uuid/decide （複数候補日の最終確定）
-    const notifDecide = path.match(new RegExp(`^/notifications/(${UUID_RE})/decide$`));
-    if (notifDecide && method === 'POST') {
-      const n = await getNotificationByUuid(db, notifDecide[1]);
-      if (!n) return json({ error: 'Not found' }, 404);
-      const b = (await request.json()) as { occurrence_uuid?: string };
-      if (typeof b.occurrence_uuid !== 'string' || !b.occurrence_uuid) {
-        return json({ error: 'occurrence_uuid required' }, 400);
-      }
-      const occ = await getOccurrenceByUuid(db, b.occurrence_uuid);
-      if (!occ || occ.notification_id !== n.id) {
-        return json({ error: 'occurrence does not belong to notification' }, 400);
-      }
-      await decideOccurrence(db, n.id, occ.id);
-      // 日付は他の投稿と同じ曜日付き書式（formatOccurrenceLabel）。本文由来の一斉ピングを防ぐため
-      // allowed_mentions={parse:[]}（意図的なメンションを載せる設計ではない・D8）。
-      const announced = await sendChannelMessage(
-        env,
-        n.channel_id,
-        `✅ **開催日が確定しました**\n\n**${formatOccurrenceLabel(occ.occurrence_date, occ.start_time || n.start_time, n.duration_minutes)}** に開催します！\n\n出欠が変わる場合は下のボタンで回答してください。`,
-        createButtonComponents(occ.id, n.type),
-        { parse: [] },
-      );
-      return json({ ok: true, decided_occurrence_uuid: occ.uuid, announced });
-    }
-    // /notifications/:uuid/undecide
-    const notifUndecide = path.match(new RegExp(`^/notifications/(${UUID_RE})/undecide$`));
-    if (notifUndecide && method === 'POST') {
-      const n = await getNotificationByUuid(db, notifUndecide[1]);
-      if (!n) return json({ error: 'Not found' }, 404);
-      await undecideNotification(db, n.id);
-      return json({ ok: true });
-    }
-    // /notifications/:uuid/recruit
-    const notifRecruit = path.match(new RegExp(`^/notifications/(${UUID_RE})/recruit$`));
-    if (notifRecruit && method === 'POST') {
-      const n = await getNotificationByUuid(db, notifRecruit[1]);
-      if (!n) return json({ error: 'Not found' }, 404);
-      const r = await recruitNotificationNow(env, n);
-      return json(r, r.ok ? 200 : 400);
     }
     // /notifications/:uuid
     const notifId = path.match(new RegExp(`^/notifications/(${UUID_RE})$`));
@@ -634,26 +642,20 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
         const input = toNotificationInput(body);
         if (!input) return json({ error: 'Invalid body' }, 400);
         if (!input.message_title) return json({ error: '見出しは必須です。' }, 400);
-        if (input.type === 'recurring' && !input.rrule) {
-          return json({ error: '繰り返しは曜日/第N曜ルールが必須です。' }, 400);
-        }
-        if (input.type === 'oneoff') {
-          const slots = candidateSlotsOf(body, input.one_off_date, input.start_time);
-          if (slots.length === 0) return json({ error: '単発は候補日時が必須です' }, 400);
-          input.one_off_date = slots[0].date;
-          input.start_time = slots[0].time;
-          const ok = await updateNotification(db, n.id, input);
-          if (!ok) return json({ ok }, 404);
-          const current = await getNotification(db, n.id);
-          if (current && current.decided_occurrence_id == null) {
-            await syncCandidateOccurrences(db, n.id, slots);
-          }
-          return json({ ok });
-        }
+        const rerr = validateRecurrence(input);
+        if (rerr) return json({ error: rerr }, 400);
+        const ferr = validateFlow(input);
+        if (ferr) return json({ error: ferr }, 400);
+        const ruleChanged = recurrenceKey(n) !== recurrenceKey(input);
         const ok = await updateNotification(db, n.id, input);
-        // rrule/anchor/start_time 変更で次回日が変わりうるため実体化をやり直させる。
-        if (ok) await setConfig(db, OCC_ROLLFORWARD_KEY, '');
-        return json({ ok }, ok ? 200 : 404);
+        if (!ok) return json({ ok }, 404);
+        // ルール（rrule/anchor/start_time・定期⇄不定期）が変わったら、何も起きていないルール回を掃除して
+        // 次ティックに新ルールで実体化し直させる（投稿済み・回答あり・manual・墓石は保持＝§5.3）。
+        const { pruned, kept_posted } = ruleChanged
+          ? await pruneRuleOccurrences(db, n.id, formatDate(getJSTNow()))
+          : { pruned: 0, kept_posted: 0 };
+        await setConfig(db, OCC_ROLLFORWARD_KEY, '');
+        return json({ ok, pruned, kept_posted });
       }
       if (method === 'DELETE') {
         const ok = await deleteNotification(db, n.id);
@@ -680,8 +682,8 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
       const buckets = await getStatusBuckets(db, occ.id, n.segment_id);
       return json({ ...buckets, recruited: await hasSentKind(db, n.id, occ.id, 'recruit') });
     }
-    // /occurrences/:uuid/recruit （単一開催回の即時募集・臨時回向け）
-    // send_log に claim/finish を記録し、cron の窓内自動募集（hasSentKind 照合）と二重にならないようにする。
+    // /occurrences/:uuid/recruit （単一開催回の即時募集/告知＝管理画面「今すぐ募集」）
+    // 実体は recruitOccurrenceNow（send_log 記録つき・/notify と共用）。already_sent は 409 で返し、UI が force 再送を確認する。
     const occRecruit = path.match(new RegExp(`^/occurrences/(${UUID_RE})/recruit$`));
     if (occRecruit && method === 'POST') {
       const occ = await getOccurrenceByUuid(db, occRecruit[1]);
@@ -689,24 +691,11 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
       if (occ.status !== 'scheduled') return json({ error: '中止された開催回は募集できません。' }, 400);
       const n = await getNotification(db, occ.notification_id);
       if (!n) return json({ error: 'Not found' }, 404);
-      const key = {
-        notification_id: n.id,
-        occurrence_id: occ.id,
-        kind: 'recruit' as const,
-        send_date: formatDate(getJSTNow()),
-      };
       // body は任意（{force?: true}）。force=送信済みでも再送する（UI の確認ダイアログ了承後のみ）。
       const b = (await request.json().catch(() => ({}))) as { force?: boolean };
-      // 新規 claim できなければ、失敗で終わった同日 claim を取り直す（当日中の手動リトライを許す）。
-      // force 時は sent も取り直す。sending（送信中）だけはどちらでも不可＝並行実行の二重送信ガード。
-      const claimed =
-        (await claimSend(db, key)) ||
-        (await reclaimFailedSend(db, key)) ||
-        (b.force === true && (await reclaimSentSend(db, key)));
-      if (!claimed) return json({ error: 'この開催回の募集は既に送信済み（または送信中）です。' }, 409);
-      const ok = await sendRecruitment(env, n, occ);
-      await finishSend(db, key, ok, ok ? null : 'manual send failed');
-      return json({ ok }, ok ? 200 : 400);
+      const r = await recruitOccurrenceNow(env, n, occ, { force: b.force === true });
+      if (r === 'already_sent') return json({ error: 'この開催回の募集は既に送信済み（または送信中）です。' }, 409);
+      return json({ ok: r === 'sent' }, r === 'sent' ? 200 : 400);
     }
     // /occurrences/:uuid ({status|date})
     const occId = path.match(new RegExp(`^/occurrences/(${UUID_RE})$`));

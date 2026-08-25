@@ -43,18 +43,16 @@ export async function verifyEd25519(
 
 import { ensureMember, updateMemberDisplayName } from '../db/members';
 import { getNotification, listNotificationsByChannel } from '../db/notifications';
-import { getOccurrence, listScheduledOccurrences } from '../db/occurrences';
-import {
-  getSegment,
-  getActiveSegmentMembers,
-  addSegmentMember,
-  getSegmentMemberStatus,
-} from '../db/segments';
+import { getOccurrence, getOrCreateOccurrence, hasCancelledOccurrenceOnDate, listScheduledOccurrences } from '../db/occurrences';
+import { getSegment, addSegmentMember, getSegmentMemberStatus } from '../db/segments';
 import { upsertResponse, getResponseStatus, getStatusBuckets } from '../db/responses';
-import { API, USER_AGENT, buildStatusMessage, buildAllStatusMessage, sendChannelMessage, answerLabels } from '../discord/rest';
+import { API, USER_AGENT, buildStatusMessage, sendChannelMessage, answerLabels } from '../discord/rest';
 import { roleGateAllows } from '../discord/syncSegment';
-import { formatOccurrenceLabel, responseDeadline, getJSTNow } from '../lib/date';
-import { recruitNotificationNow } from '../cron/tick';
+import { formatDate, formatOccurrenceLabel, responseDeadline, getJSTNow } from '../lib/date';
+import { nextOccurrenceDates } from '../lib/recurrence';
+import { hasSentKind } from '../db/sendLog';
+import { isAnnounceOnly, type Notification } from '../db/types';
+import { recruitOccurrenceNow } from '../cron/tick';
 
 const EPHEMERAL = 64;
 
@@ -72,6 +70,8 @@ interface DiscordInteraction {
   data?: {
     name?: string;
     custom_id?: string;
+    /** String Select で選ばれた値（custom_id で部品を判別する） */
+    values?: string[];
     options?: { name: string; value: string | number; type: number }[];
     resolved?: {
       users?: Record<string, DiscordUser>;
@@ -214,10 +214,18 @@ function truncateLabel(s: string, max = 80): string {
   return s.length <= max ? s : s.slice(0, max - 1) + '…';
 }
 
+/** /notify の開催回選択 String Select の custom_id（選んだ値は data.values に入る）。 */
+const NOTIFY_SELECT_ID = 'notifyocc';
+/** Discord String Select の options 上限。 */
+const NOTIFY_OPTION_LIMIT = 25;
+/** 未実体化の予定回をスケジュールごとに何回先まで候補に出すか（直近が投稿済みでもその次を選べるように 2）。 */
+const NOTIFY_PLAN_AHEAD = 2;
+
 /**
- * /notify — チャンネルに紐づく Notification を一覧化して ephemeral でボタン提示する。
- * ボタン押下時は handleButton の 'notifypick' 分岐で recruitNotificationNow を実行する。
- * 1件のときも統一して 1 ボタン出すことで、誤爆防止のクッションを兼ねる。
+ * /notify — このチャンネルのスケジュールについて「まだ投稿していない予定回」を日付順に一覧化し、
+ * String Select で 1 回選ばせる（ephemeral）。候補＝実体化済みの予定回（status=scheduled・今日以降・未投稿）
+ * ＋各スケジュールの次回 NOTIFY_PLAN_AHEAD 件（RRULE 導出・未実体化・中止の墓石は除く）。一覧表示では実体化しない。
+ * 選択時は handleNotifyPick が実体化（upsert）→ recruitOccurrenceNow（管理画面の開催回タブ「今すぐ募集」と同じ経路）。
  */
 async function handleNotify(
   interaction: DiscordInteraction,
@@ -225,36 +233,90 @@ async function handleNotify(
 ): Promise<InteractionResponse> {
   const channelId = interaction.channel_id;
   if (!channelId) return ephemeral('❌ チャンネルを特定できません。');
-  const list = await listNotificationsByChannel(env.DB, channelId);
+  const db = env.DB;
+  const list = await listNotificationsByChannel(db, channelId);
   if (list.length === 0) {
     return ephemeral('❌ このチャンネルに紐づくスケジュールがありません。管理画面で作成してください。');
   }
-  // Discord ボタン上限 5行 × 5個 = 25 件まで。超過分は省略表示する。
-  const limit = 25;
-  const shown = list.slice(0, limit);
-  const omitted = list.length - shown.length;
-  const rows: unknown[] = [];
-  for (let i = 0; i < shown.length; i += 5) {
-    rows.push({
-      type: 1,
-      components: shown.slice(i, i + 5).map((n) => ({
-        type: 2,
-        style: 2, // secondary (灰) — 即送信のため目立たせない誤爆対策
-        label: truncateLabel(n.name),
-        custom_id: `notifypick_${n.id}`,
-      })),
-    });
+  const today = formatDate(getJSTNow());
+  const opts: { n: Notification; date: string; time: string }[] = [];
+  // ponytail: スケジュール数 ×（一覧 1 ＋ 未来回ごとの hasSentKind ＋ 次回ごとの墓石照合）の直列 D1 クエリ。
+  // チャンネルあたり数件想定で 3 秒制限に十分収まる。増えたら hasSentKind の一括化か deferred 応答へ。
+  for (const n of list) {
+    const scheduled = await listScheduledOccurrences(db, n.id);
+    const taken = new Set(scheduled.map((o) => o.occurrence_date));
+    for (const o of scheduled) {
+      if (o.occurrence_date < today) continue;
+      if (await hasSentKind(db, n.id, o.id, 'recruit')) continue;
+      opts.push({ n, date: o.occurrence_date, time: o.start_time || n.start_time });
+    }
+    for (const d of nextOccurrenceDates(n, NOTIFY_PLAN_AHEAD)) {
+      if (taken.has(d) || (await hasCancelledOccurrenceOnDate(db, n.id, d))) continue;
+      opts.push({ n, date: d, time: n.start_time });
+    }
   }
-  const note =
-    omitted > 0 ? `\n…ほか ${omitted} 件は表示上限のため省略しています。` : '';
+  if (opts.length === 0) {
+    return ephemeral(
+      'ℹ️ このチャンネルのスケジュールに、いま投稿できる予定回がありません（すべて投稿済みか中止です）。再送は管理画面の「開催回」から行えます。',
+    );
+  }
+  opts.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+  const shown = opts.slice(0, NOTIFY_OPTION_LIMIT);
+  const omitted = opts.length - shown.length;
+  const note = omitted > 0 ? `\n…ほか ${omitted} 件は表示上限のため省略しています。` : '';
   return {
     type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
     data: {
-      content: `📨 **投稿するスケジュールを選んでください**${note}`,
+      content: `📨 **投稿する開催回を選んでください**${note}`,
       flags: EPHEMERAL,
-      components: rows,
+      components: [
+        {
+          type: 1,
+          components: [
+            {
+              type: 3, // String Select
+              custom_id: NOTIFY_SELECT_ID,
+              placeholder: '開催回を選ぶ',
+              options: shown.map((o) => ({
+                label: truncateLabel(formatOccurrenceLabel(o.date, o.time, o.n.duration_minutes), 100),
+                description: truncateLabel(`${o.n.name}${isAnnounceOnly(o.n) ? '（告知）' : ''}`, 100),
+                value: `${o.n.id}:${o.date}:${o.time}`,
+              })),
+            },
+          ],
+        },
+      ],
     },
   };
+}
+
+/**
+ * /notify の開催回選択（String Select）: value = notificationId:YYYY/MM/DD:HH:MM。
+ * 実体化（upsert・中止の墓石ならそのまま拒否）→ recruitOccurrenceNow。
+ * 投稿済みは再送しない（確認ダイアログの無い Discord に force の道は作らない・再送は管理画面から）。
+ */
+async function handleNotifyPick(
+  interaction: DiscordInteraction,
+  env: Env,
+): Promise<InteractionResponse> {
+  const m = (interaction.data?.values?.[0] ?? '').match(/^(\d+):(\d{4}\/\d{2}\/\d{2}):(\d{2}:\d{2})$/);
+  if (!m) return ephemeral('❌ 不正なインタラクションです');
+  const n = await getNotification(env.DB, Number(m[1]));
+  if (!n) return ephemeral('❌ 対象のスケジュールが見つかりません。');
+  if (n.channel_id !== interaction.channel_id) {
+    return ephemeral('❌ このチャンネル外のスケジュールには投稿できません。');
+  }
+  // 仮想行（RRULE 導出）の実体化は origin='rule'（既存行ならそのまま返るので manual 行の由来は変わらない）。
+  const occ = await getOrCreateOccurrence(env.DB, n.id, m[2], m[3], 'rule');
+  const noun = isAnnounceOnly(n) ? '告知' : '募集';
+  const label = `**${formatOccurrenceLabel(occ.occurrence_date, occ.start_time || n.start_time, n.duration_minutes)}**（${n.name}）`;
+  if (occ.status !== 'scheduled') return ephemeral(`❌ ${label}は中止されているため${noun}できません。`);
+  const r = await recruitOccurrenceNow(env, n, occ);
+  if (r === 'sent') return ephemeral(`✅ ${label}の${noun}メッセージを投稿しました`);
+  if (r === 'already_sent') {
+    return ephemeral(`ℹ️ ${label}の${noun}は投稿済み（または送信中）です。再送する場合は管理画面の「開催回」から行ってください。`);
+  }
+  return ephemeral(`❌ ${noun}メッセージの投稿に失敗しました（文字数超過や Discord エラーの可能性）。`);
 }
 
 /** /help — エンドユーザー向けの使い方ガイドを ephemeral で返す */
@@ -347,6 +409,9 @@ async function handleButton(
   const user = interaction.member?.user || interaction.user;
   if (!customId || !user) return ephemeral('❌ 不正なインタラクションです');
 
+  // /notify の開催回選択（String Select）。custom_id は固定で {action}_{id} 形式ではないため先に分岐する
+  if (customId === NOTIFY_SELECT_ID) return handleNotifyPick(interaction, env);
+
   const userId = user.id;
   const userName = user.username ?? '';
   const displayName = interaction.member?.nick || user.global_name || userName;
@@ -357,40 +422,8 @@ async function handleButton(
   const occurrenceId = sep >= 0 ? Number(customId.slice(sep + 1)) : NaN;
   if (!Number.isInteger(occurrenceId)) return ephemeral('❌ 不正なインタラクションです');
 
-  // /notify の通知選択（ボタン）: custom_id = notifypick_{notificationId}
-  // ※ パース都合で変数名は occurrenceId だが、ここでの実体は notificationId
-  if (action === 'notifypick') {
-    const n = await getNotification(db, occurrenceId);
-    if (!n) return ephemeral('❌ 対象のスケジュールが見つかりません。');
-    if (n.channel_id !== interaction.channel_id) {
-      return ephemeral('❌ このチャンネル外のスケジュールには投稿できません。');
-    }
-    const r = await recruitNotificationNow(env, n);
-    return ephemeral((r.ok ? '✅ ' : '❌ ') + r.message);
-  }
-
-  // 全候補の状況（単発の集約ボタン）: 末尾の数値は notificationId
-  if (action === 'statusall') {
-    try {
-      const n = await getNotification(db, occurrenceId);
-      if (!n) return ephemeral('❌ 対象のスケジュールが見つかりません。');
-      const occs = await listScheduledOccurrences(db, n.id);
-      if (occs.length === 0) return ephemeral('まだ集計できる候補がありません。');
-      // 区分メンバーは 1 回だけ取得して使い回し（候補ごとの再取得を避ける）。集計は並列実行。
-      const members = await getActiveSegmentMembers(db, n.segment_id);
-      const rows = await Promise.all(
-        occs.map(async (o) => ({
-          label: formatOccurrenceLabel(o.occurrence_date, o.start_time || n.start_time, n.duration_minutes),
-          buckets: await getStatusBuckets(db, o.id, n.segment_id, members),
-          mine: await getResponseStatus(db, o.id, userId),
-        })),
-      );
-      return ephemeral(buildAllStatusMessage(n.name, rows, n.type));
-    } catch (e) {
-      console.error('[Button] statusall error:', (e as Error).message);
-      return ephemeral('❌ 状況確認に失敗しました。');
-    }
-  }
+  // 旧 oneoff（日程調整）の「全候補の状況」集約ボタン（statusall）は oneoff 廃止（2026-08-23）で撤去。
+  // 過去メッセージのボタンは下の「不明なアクション」に落ちる。
 
   // 状況確認（1スロット）
   if (action === 'status') {
@@ -402,7 +435,7 @@ async function handleButton(
       const buckets = await getStatusBuckets(db, occ.id, n.segment_id);
       const title = formatOccurrenceLabel(occ.occurrence_date, occ.start_time || n.start_time, n.duration_minutes);
       const mine = await getResponseStatus(db, occ.id, userId);
-      return ephemeral(buildStatusMessage(title, buckets, n.type, mine));
+      return ephemeral(buildStatusMessage(title, buckets, mine));
     } catch (e) {
       console.error('[Button] status error:', (e as Error).message);
       return ephemeral('❌ 状況確認に失敗しました。');
@@ -448,8 +481,7 @@ async function handleButton(
     }
 
     // 回答締切（ADR 0014）: 締切後の変更（未回答→回答の初回を含む）を検知し、印を残して管理者へ通知。
-    // 表示ラベルはボタンと同じく通知タイプで切替（保存値は 参加/不参加/未定 で不変・D1）。
-    const L = answerLabels(n.type);
+    const L = answerLabels();
     const shown = (s: string) =>
       ({ 参加: L.participate, 不参加: L.absent, 未定: L.undecided })[s] ?? s;
     const oldStatus = await getResponseStatus(db, occ.id, userId);

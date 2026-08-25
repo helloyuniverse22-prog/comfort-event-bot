@@ -1857,6 +1857,49 @@ dialog.modal-lg.as-page .modal-foot {
   color: #fff;
   font-weight: 700;
 }
+.nf2-chip.wide {
+  width: auto;
+  padding: 0 10px;
+}
+.nf2-modes.nf2-modes-5 {
+  grid-template-columns: repeat(5, 1fr);
+}
+.nf2-seg {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 2px 0 6px;
+}
+.nf2-seg-btn {
+  padding: 6px 12px;
+  border-radius: var(--r-sm);
+  background: var(--panel);
+  border: 1px solid var(--border2);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+.nf2-seg-btn:hover {
+  border-color: var(--border-hover);
+}
+.nf2-seg-btn.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 700;
+}
+.nf2-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.nf2-live-dates {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 14px;
+}
 .nf2-discord {
   margin-top: 6px;
 }
@@ -2055,6 +2098,83 @@ dialog.modal-lg.as-page .modal-foot {
   color: var(--warn);
   font-size: 14px;
 }
+.nf2-tl-switch {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+}
+.nf2-tl-node.off .nf2-tl-dot {
+  background: var(--bg);
+  border: 2px solid var(--border2);
+}
+.nf2-tl-node.off .nf2-tl-card {
+  border-style: dashed;
+}
+.nf2-tl-node.off .nf2-tl-title > span:not(.nf2-tl-switch),
+.nf2-tl-node.off .nf2-tl-when {
+  opacity: .6;
+}
+.nf2-tl-off {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 14px;
+}
+.nf2-tl-warn,
+.nf2-tl-err {
+  position: relative;
+}
+.nf2-tl-err {
+  margin-top: 6px;
+  color: var(--danger);
+  font-size: 14px;
+}
+.nf2-tl-node.err .nf2-tl-dot {
+  background: var(--danger);
+}
+.nf2-tl-node.err .nf2-tl-card {
+  border-color: var(--danger);
+}
+.tl-err {
+  color: var(--danger);
+  font-size: 14px;
+  margin-top: 6px;
+}
+.nf2-tip {
+  cursor: help;
+  outline: none;
+  text-decoration: underline dotted currentColor;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 4px;
+}
+.nf2-tip:focus-visible {
+  box-shadow: var(--ring);
+  border-radius: var(--r-sm);
+}
+.nf2-tip::after {
+  content: attr(data-tip);
+  display: none;
+  position: absolute;
+  left: 0;
+  top: calc(100% + 6px);
+  z-index: 20;
+  width: max-content;
+  max-width: min(420px, 100%);
+  padding: 8px 10px;
+  border-radius: var(--r);
+  background: var(--panel2);
+  border: 1px solid var(--border2);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .45);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: normal;
+  text-align: left;
+}
+.nf2-tip:hover::after,
+.nf2-tip:focus::after {
+  display: block;
+}
 .nf2-tl-eventdesc {
   margin-top: 4px;
   color: var(--muted);
@@ -2123,6 +2243,9 @@ dialog.modal-lg.as-page .modal-foot {
   }
   .nf2-modes {
     grid-template-columns: 1fr;
+  }
+  .nf2-modes.nf2-modes-5 {
+    grid-template-columns: repeat(2, 1fr);
   }
   .nf2-tl-when {
     width: 84px;

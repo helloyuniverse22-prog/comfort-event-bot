@@ -1,18 +1,20 @@
-import type { Occurrence, OccurrenceStatus } from './types';
+import type { Occurrence, OccurrenceOrigin, OccurrenceStatus } from './types';
 import { newUuid } from './uuid';
 
-const COLS = 'id, uuid, notification_id, occurrence_date, start_time, status, note, created_at';
+const COLS = 'id, uuid, notification_id, occurrence_date, start_time, status, origin, note, created_at';
 
 /**
  * Occurrence を取得 or 生成。UNIQUE(notification_id, occurrence_date, start_time) で upsert。
  * スロットの同一性は (notification_id, occurrence_date, start_time) で判定する。
- * 既存なら（cancelled でも）その行を返す。
+ * 既存なら（cancelled でも・origin が違っても）その行を返す。
+ * origin: 'rule'=RRULE から実体化（ロールフォワード・仮想行の実体化）／'manual'=運用者の追加（臨時回・不定期）。
  */
 export async function getOrCreateOccurrence(
   db: D1Database,
   notificationId: number,
   dateStr: string,
   startTime: string,
+  origin: OccurrenceOrigin = 'manual',
 ): Promise<Occurrence> {
   const existing = await db
     .prepare(
@@ -25,8 +27,10 @@ export async function getOrCreateOccurrence(
 
   const uuid = newUuid();
   const res = await db
-    .prepare('INSERT INTO occurrences (uuid, notification_id, occurrence_date, start_time) VALUES (?, ?, ?, ?)')
-    .bind(uuid, notificationId, dateStr, startTime)
+    .prepare(
+      'INSERT INTO occurrences (uuid, notification_id, occurrence_date, start_time, origin) VALUES (?, ?, ?, ?, ?)',
+    )
+    .bind(uuid, notificationId, dateStr, startTime, origin)
     .run();
   const id = res.meta.last_row_id as number;
   const row = await db
@@ -41,6 +45,7 @@ export async function getOrCreateOccurrence(
       occurrence_date: dateStr,
       start_time: startTime,
       status: 'scheduled',
+      origin,
       note: null,
       created_at: '',
     }
@@ -179,10 +184,7 @@ export async function listOccurrencesForNotification(
   return results;
 }
 
-/**
- * Notification の予定回（status='scheduled'）を日付昇順で返す。
- * 単発・複数候補日の「候補日の母集合」として募集・集計に使う。
- */
+/** Notification の予定回（status='scheduled'）を日付昇順で返す。 */
 export async function listScheduledOccurrences(
   db: D1Database,
   notificationId: number,
@@ -198,44 +200,34 @@ export async function listScheduledOccurrences(
   return results;
 }
 
-/** 候補スロット（日付＋開始時刻）。同一性は (date,time) の組で判定する。 */
-export interface CandidateSlot {
-  date: string;
-  time: string;
-}
-
-const slotKey = (date: string, time: string) => `${date} ${time}`;
-
 /**
- * 候補スロット集合に occurrences を揃える（単発の複数「日付＋時間帯」用）。
- * - slots に在って未登録 → 作成。cancelled だった回は scheduled に復活。
- * - slots に無いのに scheduled な回 → cancelled にする（既存回答を失わないよう DELETE しない）。
- * recurring は遅延生成のため呼ばない（呼び出し側 admin が type='oneoff' に限定する）。
- * 返り値: 同期後の scheduled な occurrences（日付・時刻昇順）。
+ * ルール（rrule / anchor_date / start_time）変更時の掃除（docs/dev/schedule-recurrence-redesign.md §5.3）。
+ * 今日以降の **origin='rule' かつ scheduled かつ「何も起きていない」行**（send_log に sending/sent なし・
+ * 回答なし・メンバー配置なし）だけを DELETE する。投稿済み・回答あり・配置ありの rule 行、manual 行、
+ * cancelled（墓石）、過去の行は保持。削除後に次ティックのロールフォワードが新ルールで再実体化する。
+ * @returns pruned=削除件数 / kept_posted=保持した今日以降の scheduled な rule 行の件数（投稿済み等・UI 案内用）
  */
-export async function syncCandidateOccurrences(
+export async function pruneRuleOccurrences(
   db: D1Database,
   notificationId: number,
-  slots: CandidateSlot[],
-): Promise<Occurrence[]> {
-  const wanted = new Set(slots.map((s) => slotKey(s.date, s.time)));
-  const { results: existing } = await db
-    .prepare(`SELECT ${COLS} FROM occurrences WHERE notification_id = ?`)
-    .bind(notificationId)
-    .all<Occurrence>();
-  const byKey = new Map(existing.map((o) => [slotKey(o.occurrence_date, o.start_time), o]));
-
-  // 1. 欲しいスロットを確保（未登録は作成 / cancelled は復活）
-  for (const s of slots) {
-    const cur = byKey.get(slotKey(s.date, s.time));
-    if (!cur) await getOrCreateOccurrence(db, notificationId, s.date, s.time);
-    else if (cur.status === 'cancelled') await setOccurrenceStatus(db, cur.id, 'scheduled');
-  }
-  // 2. 候補から外れた scheduled 回は cancelled に
-  for (const o of existing) {
-    if (o.status === 'scheduled' && !wanted.has(slotKey(o.occurrence_date, o.start_time))) {
-      await setOccurrenceStatus(db, o.id, 'cancelled');
-    }
-  }
-  return listScheduledOccurrences(db, notificationId);
+  todayStr: string,
+): Promise<{ pruned: number; kept_posted: number }> {
+  const res = await db
+    .prepare(
+      `DELETE FROM occurrences
+        WHERE notification_id = ? AND origin = 'rule' AND status = 'scheduled' AND occurrence_date >= ?
+          AND NOT EXISTS (SELECT 1 FROM send_log s WHERE s.occurrence_id = occurrences.id AND s.status IN ('sending', 'sent'))
+          AND NOT EXISTS (SELECT 1 FROM responses r WHERE r.occurrence_id = occurrences.id)
+          AND NOT EXISTS (SELECT 1 FROM groupings g WHERE g.occurrence_id = occurrences.id)`,
+    )
+    .bind(notificationId, todayStr)
+    .run();
+  const kept = await db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM occurrences
+        WHERE notification_id = ? AND origin = 'rule' AND status = 'scheduled' AND occurrence_date >= ?`,
+    )
+    .bind(notificationId, todayStr)
+    .first<{ c: number }>();
+  return { pruned: (res.meta.changes as number) ?? 0, kept_posted: kept?.c ?? 0 };
 }

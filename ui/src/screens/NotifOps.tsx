@@ -8,7 +8,17 @@ import { FormDialog } from '../lib/FormDialog';
 import { occurrenceLabel } from '../lib/rrule';
 import type { ToastFn } from '../App';
 
-type Notification = { uuid: string; name: string; duration_minutes: number | null; start_time?: string; requires_response?: number };
+type Notification = {
+  uuid: string;
+  name: string;
+  duration_minutes: number | null;
+  start_time?: string;
+  requires_response?: number;
+  /** null = 不定期（ルールなし。開催回はここで追加した行だけ） */
+  rrule?: string | null;
+  /** 0 = 募集/告知を自動では投稿しない（📣 今すぐ募集で手動投稿・ADR 0026） */
+  recruit_enabled?: number;
+};
 type Occurrence = { uuid: string; occurrence_date: string; start_time?: string | null; status?: string };
 type Item = { n: Notification; o: Occurrence; virtual: boolean };
 
@@ -83,12 +93,33 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
   const [tallies, setTallies] = useState<Record<string, string>>({});
   // 開催回 uuid → 募集/告知を投稿済みか（/status の recruited）。「投稿済み」ステータスの判定に使う
   const [posted, setPosted] = useState<Record<string, boolean>>({});
-  // ＋臨時回ダイアログ（既存のスケジュールに単発の開催回をぶら下げる。区分・制約・配置設定を引き継ぐ）
+  // ＋開催回ダイアログ（定期＝ルール外の臨時回／不定期＝その開催回そのもの。1 ダイアログ・1 API・ADR 0025）
   const [adhocOpen, setAdhocOpen] = useState(false);
   const [adhocNotif, setAdhocNotif] = useState('');
   const [adhocDate, setAdhocDate] = useState('');
   const [adhocTime, setAdhocTime] = useState('');
   const [adhocNote, setAdhocNote] = useState('');
+
+  /** 開催回の投稿有無・集計を取得して posted/tallies に反映する（初回ロードと「今すぐ募集」後で共用） */
+  function refreshStatus(notif: Notification, o: Occurrence, isAlive: () => boolean = () => true) {
+    // 出欠確認なし（告知のみ）は回答が存在しないため集計を出さず、投稿の有無だけを示す
+    const announceOnly = notif.requires_response === 0;
+    return api(`/occurrences/${o.uuid}/status`).then(
+      (s) => {
+        if (!isAlive()) return;
+        setPosted((p) => ({ ...p, [o.uuid]: !!s.recruited }));
+        setTallies((t) => ({
+          ...t,
+          [o.uuid]: announceOnly
+            ? s.recruited
+              ? '告知済み'
+              : 'まだ投稿されていません'
+            : `${s.recruited ? '募集済み・' : ''}参加 ${s.参加.length}・不参加 ${s.不参加.length}・未定 ${s.未定.length}・未回答 ${s.未回答.length}`,
+        }));
+      },
+      () => isAlive() && setTallies((t) => ({ ...t, [o.uuid]: '状態を取得できませんでした' })),
+    );
+  }
 
   useEffect(() => {
     let alive = true;
@@ -116,24 +147,7 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
         const all = lists.flat().sort(byDateAsc);
         setItems(all);
         for (const { n: notif, o, virtual } of all) {
-          if (virtual) continue;
-          // 出欠確認なし（告知のみ）は回答が存在しないため集計を出さず、投稿の有無だけを示す
-          const announceOnly = notif.requires_response === 0;
-          api(`/occurrences/${o.uuid}/status`).then(
-            (s) => {
-              if (!alive) return;
-              setPosted((p) => ({ ...p, [o.uuid]: !!s.recruited }));
-              setTallies((t) => ({
-                ...t,
-                [o.uuid]: announceOnly
-                  ? s.recruited
-                    ? '告知済み'
-                    : 'まだ投稿されていません'
-                  : `${s.recruited ? '募集済み・' : ''}参加 ${s.参加.length}・不参加 ${s.不参加.length}・未定 ${s.未定.length}・未回答 ${s.未回答.length}`,
-              }));
-            },
-            () => alive && setTallies((t) => ({ ...t, [o.uuid]: '状態を取得できませんでした' })),
-          );
+          if (!virtual) refreshStatus(notif, o, () => alive);
         }
       } catch (e) {
         if (alive) {
@@ -160,7 +174,7 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
       if (it.virtual) {
         const created: Occurrence = await api(`/notifications/${it.n.uuid}/occurrences`, {
           method: 'POST',
-          body: JSON.stringify({ date: it.o.occurrence_date, start_time: it.o.start_time || '', status: 'cancelled' }),
+          body: JSON.stringify({ date: it.o.occurrence_date, start_time: it.o.start_time || '', status: 'cancelled', origin: 'rule' }),
         });
         setItems((cur) => cur.map((x) => (x === it ? { ...x, o: created, virtual: false } : x)));
         setTallies((t) => ({ ...t, [created.uuid]: '回答なし' }));
@@ -174,7 +188,7 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
     }
   }
 
-  /** 臨時回を追加（scheduled で実体化。cron が窓内で募集・リマインドを自動送信する） */
+  /** 開催回を追加（scheduled・origin=manual で実体化。cron が窓内で募集・リマインドを自動送信する） */
   async function addAdhoc() {
     const n = notifs?.find((x) => x.uuid === adhocNotif);
     if (!n || !adhocDate) {
@@ -203,13 +217,16 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
       );
       setTallies((t) => ({ ...t, [created.uuid]: '回答なし' }));
       setAdhocOpen(false);
-      toast(`${date} の臨時回を追加しました`);
+      toast(`${date} の開催回を追加しました`);
     } catch (e) {
       toast(e instanceof Error ? e.message : String(e), true);
     }
   }
 
-  /** 単一開催回の即時募集/告知（臨時回向け。投稿済み=409 は確認のうえ force 再送できる） */
+  /**
+   * 開催回の即時募集/告知（旧「スケジュール一覧の今すぐ募集」はここに一本化・2026-08-23）。
+   * 仮想行（未実体化の予定回）は scheduled で実体化してから投稿する。投稿済み=409 は確認のうえ force 再送できる。
+   */
   async function recruitOne(it: Item) {
     // 出欠確認なし（告知のみ）のスケジュールは操作名も「告知」で統一する（用語は CONTEXT.md）
     const noun = it.n.requires_response === 0 ? '告知' : '募集';
@@ -220,8 +237,23 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
       { title: `今すぐ${noun}`, okLabel: '投稿する' },
     );
     if (!ok) return;
+    let o = it.o;
+    if (it.virtual) {
+      // 実体化（UNIQUE(通知,日付,時刻) 上の upsert なので二重作成しない）。行もその場で実体行へ差し替える
+      try {
+        const created: Occurrence = await api(`/notifications/${it.n.uuid}/occurrences`, {
+          method: 'POST',
+          body: JSON.stringify({ date: it.o.occurrence_date, start_time: it.o.start_time || '', status: 'scheduled', origin: 'rule' }),
+        });
+        o = created;
+        setItems((cur) => cur.map((x) => (x === it ? { ...x, o: created, virtual: false } : x)));
+      } catch (e) {
+        toast(e instanceof Error ? e.message : String(e), true);
+        return;
+      }
+    }
     try {
-      await api(`/occurrences/${it.o.uuid}/recruit`, { method: 'POST' });
+      await api(`/occurrences/${o.uuid}/recruit`, { method: 'POST' });
       toast(`${noun}メッセージを投稿しました`);
     } catch (e) {
       // 投稿済み（409）: Discord 上で投稿を削除したケースを想定し、確認のうえ再送する
@@ -232,7 +264,7 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
         );
         if (!again) return;
         try {
-          await api(`/occurrences/${it.o.uuid}/recruit`, { method: 'POST', body: JSON.stringify({ force: true }) });
+          await api(`/occurrences/${o.uuid}/recruit`, { method: 'POST', body: JSON.stringify({ force: true }) });
           toast(`${noun}メッセージを再送しました`);
         } catch (e2) {
           toast(e2 instanceof Error ? e2.message : String(e2), true);
@@ -240,6 +272,9 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
         return;
       }
       toast(e instanceof Error ? e.message : String(e), true);
+    } finally {
+      // 成否にかかわらずサーバーの投稿有無・集計を取り直す（成功→「投稿済み」、409→実は投稿済みだった、等を即反映）
+      void refreshStatus(it.n, o);
     }
   }
 
@@ -316,7 +351,7 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
               setAdhocOpen(true);
             }}
           >
-            ＋ 臨時回を追加
+            ＋ 開催回を追加
           </button>
         </div>
       </div>
@@ -375,7 +410,9 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
         <div className="empty">
           この条件に当てはまる開催回がありません。
           <br />
-          上のステータスやスケジュールの絞り込みを変更してみてください。
+          {filter && notifs.find((x) => x.uuid === filter && !x.rrule)
+            ? 'このスケジュールは不定期です。「＋ 開催回を追加」から開催回を登録してください。'
+            : '上のステータスやスケジュールの絞り込みを変更してみてください。'}
         </div>
       ) : (
         shown.map((it) => {
@@ -403,7 +440,7 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
                     ▶ 再開
                   </button>
                 )}
-                {st === '予定' && !virtual && (
+                {st === '予定' && (
                   <button className="btn sm secondary" onClick={() => recruitOne(it)}>
                     📣 今すぐ{n.requires_response === 0 ? '告知' : '募集'}
                   </button>
@@ -425,7 +462,7 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
       )}
       <FormDialog
         open={adhocOpen}
-        title="臨時回を追加"
+        title="開催回を追加"
         onClose={() => setAdhocOpen(false)}
         footer={
           <>
@@ -439,8 +476,12 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
         }
       >
         <p className="muted" style={{ marginTop: 0 }}>
-          既存のスケジュールに単発の開催回を追加します。区分・ペア制約・配置設定はそのスケジュールのものを引き継ぎ、
-          募集/告知・リマインドは通常の回と同じタイミングで自動送信されます（すぐ投稿したい場合は追加後に「📣」ボタン）。
+          {notifs.find((x) => x.uuid === adhocNotif)?.rrule
+            ? '定期のスケジュールに、ルール外の臨時の開催回（振替・コラボなど）を追加します。区分・ペア制約・配置設定はそのスケジュールのものを引き継ぎ、'
+            : '不定期のスケジュールに開催回を追加します。区分・ペア制約・配置設定はそのスケジュールのものを引き継ぎ、'}
+          {notifs.find((x) => x.uuid === adhocNotif)?.recruit_enabled === 0
+            ? 'このスケジュールは完全手動の設定です。追加後に「📣」ボタンで投稿してください（自動では何も送信されません）。'
+            : '募集/告知は配信設定どおり自動投稿されます（すぐ投稿したい場合は追加後に「📣」ボタン）。'}
         </p>
         <label>
           対象のスケジュール
@@ -455,6 +496,7 @@ export function NotifOps({ guild, toast, onOpenGrouping }: { guild: Guild; toast
             {notifs.map((n) => (
               <option key={n.uuid} value={n.uuid}>
                 {n.name}
+                {n.rrule ? '' : '（不定期）'}
               </option>
             ))}
           </select>

@@ -17,6 +17,27 @@ export interface SetupStatus {
   interaction_endpoint_url: string;
   /** 管理画面 URL */
   admin_url: string;
+  /**
+   * Bot の招待 URL（別サーバーへの追加招待・退出後の再招待用）。DISCORD_APPLICATION_ID 未設定なら null。
+   * 保存値ではなくアプリ ID からの派生値（唯一の真実はシークレット）。
+   */
+  invite_url: string | null;
+}
+
+/**
+ * 招待時に要求する権限ビット: VIEW_CHANNEL(1024)+SEND_MESSAGES(2048)+MENTION_EVERYONE(131072)。
+ * セットアップガイド（setup.src.html の INVITE_PERMS）と同値に保つこと。
+ */
+export const INVITE_PERMISSIONS = '134144';
+
+/** 招待 URL を組み立てる（scope は bot＋applications.commands＝スラッシュコマンド用）。 */
+export function inviteUrl(applicationId: string): string {
+  return (
+    'https://discord.com/oauth2/authorize?client_id=' +
+    encodeURIComponent(applicationId) +
+    '&scope=bot%20applications.commands&permissions=' +
+    INVITE_PERMISSIONS
+  );
 }
 
 /** 現在のセットアップ状況（シークレット有無・各種URL）を返す。 */
@@ -31,6 +52,7 @@ export function getSetupStatus(env: Env, request: Request): SetupStatus {
     },
     interaction_endpoint_url: `${origin}/interactions`,
     admin_url: `${origin}/`,
+    invite_url: env.DISCORD_APPLICATION_ID ? inviteUrl(env.DISCORD_APPLICATION_ID) : null,
   };
 }
 

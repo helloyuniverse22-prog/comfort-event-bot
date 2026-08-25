@@ -1,20 +1,21 @@
 import type { MentionMode, Notification, NotificationListItem, NotificationType } from './types';
-import { listOccurrencesForNotification, setOccurrenceStatus } from './occurrences';
+import { formatDate, getJSTNow } from '../lib/date';
 import { newUuid } from './uuid';
 
+// one_off_date / decided_occurrence_id 列は旧 oneoff 用（2026-08-23 廃止・migration 0023）。列は休眠残置・ここでは読まない。
 const COLS =
-  'id, uuid, guild_id, segment_id, name, channel_id, type, rrule, one_off_date, anchor_date, start_time, ' +
+  'id, uuid, guild_id, segment_id, name, channel_id, type, rrule, anchor_date, start_time, ' +
   'duration_minutes, recruit_days_before, remind_start_days, remind_undecided_days, ' +
+  'recruit_enabled, remind_unanswered_enabled, remind_undecided_enabled, ' +
   'quota_enabled, quota_interval_days, assignment_enabled, grouping_enabled, mention_enabled, mention_mode, ' +
   'requires_response, message_title, message_body, active, ' +
   'response_deadline_hours, change_alert_channel_id, send_hour, ' +
-  'grouping_channel_id, decided_occurrence_id, created_at';
+  'grouping_channel_id, created_at';
 
-/** 一覧表示用の集計列（候補数・確定回の日時）。COLS に続けて付与する。 */
+/** 一覧表示用の集計列（今日以降の直近の予定回の日付）。COLS に続けて付与し、today('YYYY/MM/DD') を 1 つ bind する。 */
 const LIST_EXTRA =
-  `, (SELECT COUNT(*) FROM occurrences o WHERE o.notification_id = notifications.id AND o.status = 'scheduled') AS candidate_count` +
-  `, (SELECT o.occurrence_date FROM occurrences o WHERE o.id = notifications.decided_occurrence_id) AS decided_date` +
-  `, (SELECT o.start_time FROM occurrences o WHERE o.id = notifications.decided_occurrence_id) AS decided_time`;
+  `, (SELECT MIN(o.occurrence_date) FROM occurrences o` +
+  ` WHERE o.notification_id = notifications.id AND o.status = 'scheduled' AND o.occurrence_date >= ?) AS next_occurrence_date`;
 
 /** Notification 作成/更新の入力（数値フラグは 0/1） */
 export interface NotificationInput {
@@ -23,14 +24,19 @@ export interface NotificationInput {
   name: string;
   channel_id: string;
   type: NotificationType;
+  /** 正規化済み RRULE（src/lib/rruleGrammar.ts）。null = 不定期 */
   rrule: string | null;
-  one_off_date: string | null;
+  /** 次回の開催日（間隔 ≥ 2 のみ・ルールの開催日であること）。それ以外は null */
   anchor_date: string | null;
   start_time: string;
   duration_minutes: number | null;
   recruit_days_before: number;
   remind_start_days: number;
   remind_undecided_days: number;
+  /** 工程スイッチ 0/1（ADR 0026） */
+  recruit_enabled: number;
+  remind_unanswered_enabled: number;
+  remind_undecided_enabled: number;
   quota_enabled: number;
   quota_interval_days: number | null;
   assignment_enabled: number;
@@ -49,10 +55,14 @@ export interface NotificationInput {
   send_hour: number;
 }
 
-/** 全 Notification 取得（作成順・一覧用の集計列付き） */
-export async function listNotifications(db: D1Database): Promise<NotificationListItem[]> {
+/** 全 Notification 取得（作成順・一覧用の集計列付き）。today は next_occurrence_date の基準日（JST） */
+export async function listNotifications(
+  db: D1Database,
+  today: string = formatDate(getJSTNow()),
+): Promise<NotificationListItem[]> {
   const { results } = await db
     .prepare(`SELECT ${COLS}${LIST_EXTRA} FROM notifications ORDER BY created_at`)
+    .bind(today)
     .all<NotificationListItem>();
   return results;
 }
@@ -118,14 +128,15 @@ export async function listNotificationsByChannel(
   return results;
 }
 
-/** Server(guild_id) 配下の Notification 一覧（一覧用の集計列付き） */
+/** Server(guild_id) 配下の Notification 一覧（一覧用の集計列付き）。today は next_occurrence_date の基準日（JST） */
 export async function listNotificationsByGuild(
   db: D1Database,
   guildId: string,
+  today: string = formatDate(getJSTNow()),
 ): Promise<NotificationListItem[]> {
   const { results } = await db
     .prepare(`SELECT ${COLS}${LIST_EXTRA} FROM notifications WHERE guild_id = ? ORDER BY created_at`)
-    .bind(guildId)
+    .bind(today, guildId)
     .all<NotificationListItem>();
   return results;
 }
@@ -139,12 +150,13 @@ export async function createNotification(
   const res = await db
     .prepare(
       `INSERT INTO notifications (
-         uuid, guild_id, segment_id, name, channel_id, type, rrule, one_off_date, anchor_date, start_time,
+         uuid, guild_id, segment_id, name, channel_id, type, rrule, anchor_date, start_time,
          duration_minutes, recruit_days_before, remind_start_days, remind_undecided_days,
+         recruit_enabled, remind_unanswered_enabled, remind_undecided_enabled,
          quota_enabled, quota_interval_days, assignment_enabled, grouping_enabled, mention_mode, requires_response,
          message_title, message_body, active,
          response_deadline_hours, change_alert_channel_id, send_hour
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       uuid,
@@ -154,13 +166,15 @@ export async function createNotification(
       input.channel_id,
       input.type,
       input.rrule ?? null,
-      input.one_off_date ?? null,
       input.anchor_date ?? null,
       input.start_time,
       input.duration_minutes ?? null,
       input.recruit_days_before,
       input.remind_start_days,
       input.remind_undecided_days,
+      input.recruit_enabled,
+      input.remind_unanswered_enabled,
+      input.remind_undecided_enabled,
       input.quota_enabled,
       input.quota_interval_days ?? null,
       input.assignment_enabled,
@@ -184,7 +198,6 @@ export async function createNotification(
       id,
       uuid,
       created_at: '',
-      decided_occurrence_id: null,
       grouping_channel_id: null,
       mention_enabled: input.mention_mode === 'role' ? 1 : 0,
       ...input,
@@ -202,9 +215,10 @@ export async function updateNotification(
     .prepare(
       `UPDATE notifications SET
          guild_id = ?, segment_id = ?, name = ?, channel_id = ?, type = ?, rrule = ?,
-         one_off_date = ?, anchor_date = ?, start_time = ?, duration_minutes = ?,
+         anchor_date = ?, start_time = ?, duration_minutes = ?,
          recruit_days_before = ?, remind_start_days = ?,
-         remind_undecided_days = ?, quota_enabled = ?, quota_interval_days = ?,
+         remind_undecided_days = ?, recruit_enabled = ?, remind_unanswered_enabled = ?,
+         remind_undecided_enabled = ?, quota_enabled = ?, quota_interval_days = ?,
          assignment_enabled = ?, grouping_enabled = ?, mention_mode = ?, requires_response = ?,
          message_title = ?, message_body = ?, active = ?,
          response_deadline_hours = ?, change_alert_channel_id = ?, send_hour = ?
@@ -217,13 +231,15 @@ export async function updateNotification(
       patch.channel_id,
       patch.type,
       patch.rrule ?? null,
-      patch.one_off_date ?? null,
       patch.anchor_date ?? null,
       patch.start_time,
       patch.duration_minutes ?? null,
       patch.recruit_days_before,
       patch.remind_start_days,
       patch.remind_undecided_days,
+      patch.recruit_enabled,
+      patch.remind_unanswered_enabled,
+      patch.remind_undecided_enabled,
       patch.quota_enabled,
       patch.quota_interval_days ?? null,
       patch.assignment_enabled,
@@ -256,53 +272,6 @@ export async function setGroupingChannel(
     .bind(channelId, id)
     .run();
   return (res.meta.changes ?? 0) > 0;
-}
-
-/**
- * 単発・複数候補日の確定回を設定/解除する（occurrences.id または NULL）。
- * 候補回の cancel/復活は呼び出し側（admin）で行う。対象通知が無ければ false。
- */
-export async function setDecidedOccurrence(
-  db: D1Database,
-  notificationId: number,
-  occurrenceId: number | null,
-): Promise<boolean> {
-  const res = await db
-    .prepare('UPDATE notifications SET decided_occurrence_id = ? WHERE id = ?')
-    .bind(occurrenceId, notificationId)
-    .run();
-  return (res.meta.changes ?? 0) > 0;
-}
-
-/**
- * 複数候補日の最終確定。指定回を scheduled に保ち、他の候補回（scheduled）を cancelled にして
- * decided_occurrence_id を設定する。回答は保全（occurrences/responses は消さない）。
- */
-export async function decideOccurrence(
-  db: D1Database,
-  notificationId: number,
-  occurrenceId: number,
-): Promise<void> {
-  await setOccurrenceStatus(db, occurrenceId, 'scheduled');
-  const all = await listOccurrencesForNotification(db, notificationId, 1000);
-  for (const o of all) {
-    if (o.id !== occurrenceId && o.status === 'scheduled') {
-      await setOccurrenceStatus(db, o.id, 'cancelled');
-    }
-  }
-  await setDecidedOccurrence(db, notificationId, occurrenceId);
-}
-
-/** 確定解除。decided_occurrence_id を NULL に戻し、cancelled な候補回を scheduled に復活する。 */
-export async function undecideNotification(
-  db: D1Database,
-  notificationId: number,
-): Promise<void> {
-  await setDecidedOccurrence(db, notificationId, null);
-  const all = await listOccurrencesForNotification(db, notificationId, 1000);
-  for (const o of all) {
-    if (o.status === 'cancelled') await setOccurrenceStatus(db, o.id, 'scheduled');
-  }
 }
 
 /**

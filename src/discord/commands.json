@@ -1,7 +1,7 @@
 [
   {
     "name": "notify",
-    "description": "スケジュールを選んで募集/告知を今すぐ投稿します (管理者用)",
+    "description": "開催回を選んで募集/告知を今すぐ投稿します (管理者用)",
     "default_member_permissions": "8"
   },
   {

@@ -7,6 +7,8 @@ import type { ToastFn } from '../App';
 type SetupStatus = {
   secrets: Record<string, boolean>;
   interaction_endpoint_url: string;
+  /** 招待 URL（DISCORD_APPLICATION_ID 未設定なら null） */
+  invite_url?: string | null;
 };
 
 const SECRET_ROWS: [string, string][] = [
@@ -29,14 +31,15 @@ export function Setup({ guild, toast, onLeft }: { guild: Guild; toast: ToastFn; 
 
   if (!st) return <p className="muted">読み込み中…</p>;
 
-  const copyEndpoint = async () => {
+  const copyText = async (text: string) => {
     try {
-      await navigator.clipboard.writeText(st.interaction_endpoint_url);
+      await navigator.clipboard.writeText(text);
       toast('コピーしました');
     } catch {
       toast('コピーできませんでした。URL を手動で選択してください', true);
     }
   };
+  const copyEndpoint = () => copyText(st.interaction_endpoint_url);
 
   const registerCommands = async (btn: HTMLElement | null) => {
     setRegisterResult('登録中…');
@@ -146,6 +149,28 @@ export function Setup({ guild, toast, onLeft }: { guild: Guild; toast: ToastFn; 
         <p className="muted" style={{ fontSize: 13 }}>
           左メニューの「メンバー区分」で区分を作成してメンバーを登録し、「スケジュール設定」でスケジュールを作成すれば完了です。
         </p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Bot を別のサーバーに招待</legend>
+        <p className="muted" style={{ fontSize: 13 }}>
+          別のサーバーでもこの Bot を使うとき、退出したサーバーに戻すときは下のリンクから招待してください
+          （権限はセットアップガイドと同じ）。招待後にページを再読み込みすると、サーバー一覧に表示されます。
+        </p>
+        {st.invite_url ? (
+          <div className="pickrow">
+            <a href={st.invite_url} target="_blank" rel="noreferrer" style={{ wordBreak: 'break-all' }}>
+              {st.invite_url}
+            </a>
+            <button className="btn sm" onClick={() => copyText(st.invite_url!)}>
+              コピー
+            </button>
+          </div>
+        ) : (
+          <p className="muted" style={{ fontSize: 13 }}>
+            DISCORD_APPLICATION_ID が未設定のため作成できません（上の 1. を確認してください）。
+          </p>
+        )}
       </fieldset>
 
       <fieldset>

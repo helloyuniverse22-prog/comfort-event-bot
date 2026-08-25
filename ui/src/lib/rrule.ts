@@ -1,6 +1,22 @@
-// 繰り返しスケジュール（RRULE は隠して weekly/biweekly/monthly の3モードのみ UI に出す）。
-// 旧 ui/index.html の同名関数群の純関数移植（DOM 非依存）。
-export const WEEKDAYS: [string, string][] = [
+// 繰り返し（RRULE サブセット文法）の UI 側ヘルパ。文法・正規化はサーバーと同じ純関数
+// src/lib/rruleGrammar.ts を直接 import して共有する（文法の真実は 1 か所・rrule.js は UI に同梱しない）。
+// 日付の列挙（プレビュー・次回の開催日候補）はサーバー POST /notifications/preview-plan。
+// 設計: docs/dev/schedule-recurrence-redesign.md §5.1・§6（2026-08-23）。
+import {
+  INTERVAL_MAX,
+  WEEKDAY_CODES,
+  formatRule,
+  parseRule,
+  type Freq,
+  type RuleModel,
+  type WeekdayCode,
+} from '../../../src/lib/rruleGrammar';
+
+export { INTERVAL_MAX, formatRule, parseRule };
+export type { Freq, RuleModel, WeekdayCode };
+
+/** 表示順は日〜土（日本のカレンダー慣行）。保存形の並びは formatRule が月曜起点に正規化する */
+export const WEEKDAYS: [WeekdayCode, string][] = [
   ['SU', '日'],
   ['MO', '月'],
   ['TU', '火'],
@@ -19,51 +35,41 @@ export const NTH: [string, string][] = [
 ];
 export const wdLabel = (c: string) => (WEEKDAYS.find((w) => w[0] === c) || ['', ''])[1];
 export const nthLabel = (n: string | number) => (NTH.find((x) => x[0] === String(n)) || ['', ''])[1];
+export const WEEKDAYS_MON_FRI: WeekdayCode[] = ['MO', 'TU', 'WE', 'TH', 'FR'];
 
-export type RepeatMode = 'weekly' | 'biweekly' | 'monthly';
+/** 毎月「第N曜」ルール 1 件（セレクトの値は文字列のまま持つ） */
 export type MonthlyRule = { nth: string; byday: string };
 
-export function buildRRule(mode: RepeatMode, byday: string, monthlyRules: MonthlyRule[]): string {
-  if (mode === 'weekly') return `FREQ=WEEKLY;BYDAY=${byday}`;
-  if (mode === 'biweekly') return `FREQ=WEEKLY;INTERVAL=2;BYDAY=${byday}`;
-  if (mode === 'monthly') {
-    const rules = dedupeMonthlyRules(monthlyRules);
-    return rules.length ? `FREQ=MONTHLY;BYDAY=${rules.map((r) => r.nth + r.byday).join(',')}` : '';
-  }
-  return '';
-}
+/**
+ * フォームの「開催日時」ステップの状態（カード＋入力）。文法モデルと相互変換できる。
+ * freq 'IRREGULAR' = 不定期（rrule NULL・入力なし）。
+ */
+export type RuleForm = {
+  freq: Freq | 'IRREGULAR';
+  /** 1..INTERVAL_MAX[freq]（入力途中の不正値も保持して missing で弾く） */
+  interval: number;
+  /** WEEKLY の曜日（複数） */
+  weekdays: WeekdayCode[];
+  /** MONTHLY の方式 */
+  monthlyMode: 'byday' | 'bymonthday';
+  monthlyRules: MonthlyRule[];
+  /** MONTHLY 日付（1..31・-1=月末） */
+  monthDays: number[];
+  /** YEARLY の月日 */
+  yearMonth: number;
+  yearDay: number;
+};
 
-export function parseRRuleToBuilder(rrule?: string | null): {
-  mode: RepeatMode;
-  byday: string;
-  rules: MonthlyRule[];
-} {
-  const out: { mode: RepeatMode; byday: string; rules: MonthlyRule[] } = { mode: 'weekly', byday: 'SA', rules: [] };
-  if (!rrule) return out;
-  const p = Object.fromEntries(
-    rrule.split(';').map((x) => {
-      const [k, v] = x.split('=');
-      return [k.toUpperCase(), v];
-    }),
-  );
-  const freq = (p.FREQ || '').toUpperCase();
-  const byday = (p.BYDAY || '').toUpperCase();
-  if (freq === 'MONTHLY') {
-    out.mode = 'monthly';
-    out.rules = byday
-      .split(',')
-      .map((tok) => {
-        const m = tok.match(/^(-?\d+)([A-Z]{2})$/);
-        return m ? { nth: m[1], byday: m[2] } : null;
-      })
-      .filter((x): x is MonthlyRule => !!x);
-    if (out.rules.length) out.byday = out.rules[0].byday;
-  } else if (freq === 'WEEKLY') {
-    out.mode = p.INTERVAL === '2' ? 'biweekly' : 'weekly';
-    out.byday = byday.replace(/^-?\d+/, '') || 'SA';
-  }
-  return out;
-}
+export const DEFAULT_RULE_FORM: RuleForm = {
+  freq: 'WEEKLY',
+  interval: 1,
+  weekdays: ['SA'],
+  monthlyMode: 'byday',
+  monthlyRules: [{ nth: '2', byday: 'SA' }],
+  monthDays: [],
+  yearMonth: 1,
+  yearDay: 1,
+};
 
 export function dedupeMonthlyRules(rules: MonthlyRule[]): MonthlyRule[] {
   const seen = new Set<string>();
@@ -78,51 +84,122 @@ export function dedupeMonthlyRules(rules: MonthlyRule[]): MonthlyRule[] {
   return out;
 }
 
-/** 「毎月 第1・第3・第5 日曜日」/ 混在「毎月 第1日曜・第3火曜」 */
-export function humanMonthly(rules: MonthlyRule[]): string {
-  if (!rules.length) return '毎月（未設定）';
-  const wds = new Set(rules.map((r) => r.byday));
-  if (wds.size === 1) return `毎月 ${rules.map((r) => nthLabel(r.nth)).join('・')} ${wdLabel(rules[0].byday)}曜日`;
-  return `毎月 ${rules.map((r) => nthLabel(r.nth) + wdLabel(r.byday) + '曜').join('・')}`;
-}
-
-function fmtDate(d: Date): string {
-  return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
-}
-
-/** 隔週の起点候補: 指定曜日の直近の日付を count 個（今日以降） */
-export function nextWeekdayDates(code: string, count: number): string[] {
-  const idx = WEEKDAYS.findIndex((w) => w[0] === code);
-  const out: string[] = [];
-  const base = new Date();
-  base.setHours(0, 0, 0, 0);
-  for (let i = 0; i < 90 && out.length < count; i++) {
-    const t = new Date(base);
-    t.setDate(base.getDate() + i);
-    if (t.getDay() === idx) out.push(fmtDate(t));
+/** 文法モデル → フォーム状態（既定値に上書き）。null（不定期）は IRREGULAR */
+export function ruleFormFromModel(m: RuleModel | null): RuleForm {
+  if (!m) return { ...DEFAULT_RULE_FORM, freq: 'IRREGULAR' };
+  const f: RuleForm = { ...DEFAULT_RULE_FORM, freq: m.freq, interval: m.interval };
+  if (m.freq === 'WEEKLY') f.weekdays = m.byday.map((d) => d.day);
+  if (m.freq === 'MONTHLY') {
+    if (m.byday.length) {
+      f.monthlyMode = 'byday';
+      f.monthlyRules = m.byday.map((d) => ({ nth: String(d.nth), byday: d.day }));
+    } else {
+      f.monthlyMode = 'bymonthday';
+      f.monthDays = [...m.bymonthday];
+    }
   }
-  return out;
+  if (m.freq === 'YEARLY') {
+    f.yearMonth = m.bymonth[0];
+    f.yearDay = m.bymonthday[0];
+  }
+  return f;
 }
 
-/** 起点日('YYYY/MM/DD')の曜日が選択曜日コードと一致するか（不正な日付は false） */
-export function anchorMatchesWeekday(anchor: string, code: string): boolean {
-  const [y, m, d] = (anchor || '').split('/').map(Number);
-  return !!y && !!m && !!d && new Date(y, m - 1, d).getDay() === WEEKDAYS.findIndex((w) => w[0] === code);
+/** フォーム状態 → 文法モデル。不定期・入力不足（曜日なし等）・間隔不正は null */
+export function modelFromRuleForm(f: RuleForm): RuleModel | null {
+  if (f.freq === 'IRREGULAR') return null;
+  const interval = f.interval;
+  if (!Number.isInteger(interval) || interval < 1 || interval > INTERVAL_MAX[f.freq]) return null;
+  const base: RuleModel = { freq: f.freq, interval, byday: [], bymonthday: [], bymonth: [] };
+  switch (f.freq) {
+    case 'DAILY':
+      return base;
+    case 'WEEKLY':
+      if (!f.weekdays.length) return null;
+      return { ...base, byday: f.weekdays.map((day) => ({ nth: 0, day })) };
+    case 'MONTHLY':
+      if (f.monthlyMode === 'byday') {
+        const rules = dedupeMonthlyRules(f.monthlyRules);
+        if (!rules.length) return null;
+        return { ...base, byday: rules.map((r) => ({ nth: Number(r.nth), day: r.byday as WeekdayCode })) };
+      }
+      if (!f.monthDays.length) return null;
+      return { ...base, bymonthday: [...f.monthDays] };
+    case 'YEARLY':
+      return { ...base, bymonth: [f.yearMonth], bymonthday: [f.yearDay] };
+  }
+}
+
+/** フォーム状態 → 保存する RRULE（正規形）。不定期・不完全は null */
+export function rruleFromRuleForm(f: RuleForm): string | null {
+  const m = modelFromRuleForm(f);
+  return m ? formatRule(m) : null;
+}
+
+const nthOrder = (nth: number) => (nth === -1 ? 99 : nth);
+
+/** 「第1・第3・第5 日曜日」/ 混在「第1日曜・第3火曜」（並びは保存形と同じ: 第N→曜日、最終は末尾） */
+function describeMonthlyByday(input: { nth: number; day: WeekdayCode }[]): string {
+  const rules = [...input].sort((a, b) => nthOrder(a.nth) - nthOrder(b.nth) || WEEKDAY_CODES.indexOf(a.day) - WEEKDAY_CODES.indexOf(b.day));
+  const wds = new Set(rules.map((r) => r.day));
+  if (wds.size === 1) return `${rules.map((r) => nthLabel(r.nth)).join('・')} ${wdLabel(rules[0].day)}曜日`;
+  return rules.map((r) => nthLabel(r.nth) + wdLabel(r.day) + '曜').join('・');
+}
+
+function describeWeekdays(days: WeekdayCode[]): string {
+  const set = new Set(days);
+  if (set.size === 5 && WEEKDAYS_MON_FRI.every((d) => set.has(d))) return '平日（月〜金）';
+  // 文言は月曜起点（WKST=MO・保存形と同じ並び）。週末が「土・日」と読める
+  return WEEKDAY_CODES.filter((c) => set.has(c))
+    .map((c) => wdLabel(c))
+    .join('・') + '曜日';
+}
+
+const monthDayLabel = (d: number) => (d === -1 ? '月末' : `${d}日`);
+
+/** 'YYYY/MM/DD' を「M/D」（今年）または「YYYY/M/D」に */
+export function shortDate(ymd: string, now: Date = new Date()): string {
+  const [y, m, d] = ymd.split('/').map(Number);
+  if (!y || !m || !d) return ymd;
+  return y === now.getFullYear() ? `${m}/${d}` : `${y}/${m}/${d}`;
 }
 
 /**
- * 隔週の次回開催日: 起点日('YYYY/MM/DD')から14日刻みで today 以降の最初の日。
- * 起点が未来ならそのまま返す。不正な起点は null（呼び出し側でフォールバック）。
- * サーバ nextOccurrenceDates の anchor パリティと同等（日粒度・当日 start_time 境界は近似）。
+ * 要約文言（確認ステップ・開催日時の即時表示・一覧で共用・docs §6.4）。
+ * 例: 「毎週 土・日曜日 21:00〜23:00」「隔週 土曜日 21:00〜（次回 9/5）」「毎月 15日・月末 21:00〜」
+ *     「2年おき 3月20日 21:00〜（次回 2027/3/20）」「不定期 21:00〜」「不定期 21:00〜（次回 9/9）」
+ * nextDate は間隔 ≥ 2（次回の開催日）または不定期（直近の予定回）のときだけ付く。
  */
-export function nextBiweeklyFromAnchor(anchor: string, today: Date = new Date()): string | null {
-  const [y, m, d] = (anchor || '').split('/').map(Number);
-  if (!y || !m || !d) return null;
-  const t = new Date(y, m - 1, d);
-  const base = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-  const diff = base.getTime() - t.getTime();
-  if (diff > 0) t.setDate(t.getDate() + Math.ceil(diff / (14 * 86_400_000)) * 14);
-  return fmtDate(t);
+export function describeRule(
+  m: RuleModel | null,
+  startTime: string | null | undefined,
+  duration: number | null | undefined,
+  nextDate?: string | null,
+): string {
+  const tr = fmtTimeRange(startTime || '', duration);
+  const next = nextDate ? `（次回 ${shortDate(nextDate)}）` : '';
+  if (!m) return `不定期 ${tr}${next}`;
+  const n = m.interval;
+  let head: string;
+  switch (m.freq) {
+    case 'DAILY':
+      head = n === 1 ? '毎日' : `${n}日おき`;
+      break;
+    case 'WEEKLY':
+      head = `${n === 1 ? '毎週' : n === 2 ? '隔週' : `${n}週おき`} ${describeWeekdays(m.byday.map((d) => d.day))}`;
+      break;
+    case 'MONTHLY':
+      head = `${n === 1 ? '毎月' : n === 2 ? '隔月' : `${n}か月おき`} ${
+        m.byday.length
+          ? describeMonthlyByday(m.byday)
+          : [...m.bymonthday].sort((a, b) => nthOrder(a) - nthOrder(b)).map(monthDayLabel).join('・')
+      }`;
+      break;
+    case 'YEARLY':
+      head = `${n === 1 ? '毎年' : `${n}年おき`} ${m.bymonth[0]}月${m.bymonthday[0]}日`;
+      break;
+  }
+  return `${head} ${tr}${n >= 2 ? next : ''}`;
 }
 
 function addMinsToTime(time: string, minutes: number): { time: string; nextDay: boolean } {
@@ -148,26 +225,18 @@ export function occurrenceLabel(dateStr: string, time?: string | null, dur?: num
   return `${dateStr}${w ? ` (${w})` : ''}${time ? ' ' + fmtTimeRange(time, dur) : ''}`;
 }
 
-/** スケジュール一覧向けの短い自然文（毎週/隔週/毎月＋時間帯）。recurring 専用（oneoff は呼び出し側で別処理）。 */
-export function humanRRule(rrule: string | null | undefined, time: string | null | undefined, dur: number | null | undefined): string {
-  const b = parseRRuleToBuilder(rrule);
-  const wd = wdLabel(b.byday);
-  const tr = fmtTimeRange(time || '', dur);
-  if (b.mode === 'weekly') return `毎週 ${wd}曜日 ${tr}`;
-  if (b.mode === 'biweekly') return `隔週 ${wd}曜日 ${tr}`;
-  return `${humanMonthly(b.rules)} ${tr}`;
+/** 'YYYY/MM/DD' → 「M/D(曜)」（プレビューの「次の開催日」列挙用） */
+export function shortDateWithWeekday(ymd: string, now: Date = new Date()): string {
+  const [y, m, d] = ymd.split('/').map(Number);
+  if (!y || !m || !d) return ymd;
+  return `${shortDate(ymd, now)}(${'日月火水木金土'[new Date(y, m - 1, d).getDay()]})`;
 }
 
-export function scheduleSummary(opts: {
-  mode: RepeatMode;
-  weekday: string;
-  startTime: string;
-  duration: number | null;
-  monthlyRules: MonthlyRule[];
-  biweeklyAnchor?: string;
-}): string {
-  const tr = fmtTimeRange(opts.startTime || '21:00', opts.duration);
-  if (opts.mode === 'weekly') return `毎週 ${wdLabel(opts.weekday)}曜日 ${tr}`;
-  if (opts.mode === 'biweekly') return `隔週 ${wdLabel(opts.weekday)}曜日 ${tr}（次回 ${opts.biweeklyAnchor || '—'}）`;
-  return `${humanMonthly(dedupeMonthlyRules(opts.monthlyRules))} ${tr}`;
+/** 'YYYY/MM/DD' と今日（ローカル）の日数差（密度警告用）。不正は NaN */
+export function daysFromToday(ymd: string, now: Date = new Date()): number {
+  const [y, m, d] = ymd.split('/').map(Number);
+  if (!y || !m || !d) return NaN;
+  const a = new Date(y, m - 1, d).getTime();
+  const b = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  return Math.round((a - b) / 86_400_000);
 }

@@ -1,5 +1,5 @@
 import type { Env } from '../env';
-import type { Member, EventStatusBuckets, MentionMode, NotificationType, Segment } from '../db/types';
+import type { Member, EventStatusBuckets, MentionMode, Segment } from '../db/types';
 import { setDmChannelId } from '../db/members';
 import pkg from '../../package.json';
 
@@ -16,29 +16,25 @@ export function mentionUser(userId: string): string {
   return `<@${userId}>`;
 }
 
-/** 回答の表示ラベル（保存値・custom_id は不変。単発=日程調整は「可/不可/未確定」表記）。 */
+/**
+ * 回答の表示ラベル（保存値・custom_id は不変）。旧 oneoff（日程調整）の「可/不可/未確定」表記は
+ * oneoff 廃止（2026-08-23・ADR 0025）で撤去し、常に 参加/不参加/未定。
+ */
 export interface AnswerLabels {
   participate: string;
   absent: string;
   undecided: string;
 }
-export function answerLabels(type: NotificationType): AnswerLabels {
-  return type === 'oneoff'
-    ? { participate: '可', absent: '不可', undecided: '未確定' }
-    : { participate: '参加', absent: '不参加', undecided: '未定' };
+export function answerLabels(): AnswerLabels {
+  return { participate: '参加', absent: '不参加', undecided: '未定' };
 }
 
 /**
  * 出欠回答ボタン（可否/状況確認）。custom_id は {action}_{occurrenceId} で固定（保存値も不変）。
- * type で表示ラベルのみ切替（oneoff=可/不可/未確定）。includeStatus=false で状況確認ボタンを省く
- * （単発の複数候補は各スロットに状況確認を付けず、ヘッダの集約ボタンへ寄せるため）。
+ * includeStatus=false で状況確認ボタンを省く。
  */
-export function createButtonComponents(
-  occurrenceId: number,
-  type: NotificationType = 'recurring',
-  includeStatus = true,
-): unknown[] {
-  const L = answerLabels(type);
+export function createButtonComponents(occurrenceId: number, includeStatus = true): unknown[] {
+  const L = answerLabels();
   const components: unknown[] = [
     { type: 2, style: 3, label: L.participate, custom_id: `participate_${occurrenceId}` },
     { type: 2, style: 4, label: L.absent, custom_id: `absent_${occurrenceId}` },
@@ -48,18 +44,6 @@ export function createButtonComponents(
     components.push({ type: 2, style: 2, label: '📊 状況確認', custom_id: `status_${occurrenceId}` });
   }
   return [{ type: 1, components }];
-}
-
-/** 単発の複数候補募集ヘッダ用：全候補の状況をまとめて返す集約ボタン。custom_id は statusall_{notificationId}。 */
-export function createStatusAllButton(notificationId: number): unknown[] {
-  return [
-    {
-      type: 1,
-      components: [
-        { type: 2, style: 2, label: '📊 全候補の状況', custom_id: `statusall_${notificationId}` },
-      ],
-    },
-  ];
 }
 
 /** バイネームメンションの既定文字予算。呼び出し側が本文長に応じて動的に下げる（ADR 0010）。 */
@@ -133,59 +117,21 @@ function answerEmojiLabel(status: string | null, L: AnswerLabels): string {
 
 /**
  * 状況確認メッセージ。title は日付（または 'YYYY/MM/DD (曜) HH:MM〜' 等の表示ラベル）。
- * type で見出し・回答ラベルを切替（oneoff=調整状況・可/不可/未確定）。集計バケットのキー自体は不変。
  * myAnswer を渡すと（null=未回答含む）先頭に「あなたの回答」行を出す。undefined なら省略（従来表示）。
  * 名前一覧は subtext（-#）で小さく表示し、人数が多いときの視覚ノイズを抑える。
  */
-export function buildStatusMessage(
-  title: string,
-  s: EventStatusBuckets,
-  type: NotificationType = 'recurring',
-  myAnswer?: string | null,
-): string {
-  const L = answerLabels(type);
-  const head = type === 'oneoff' ? '調整状況' : '参加状況';
+export function buildStatusMessage(title: string, s: EventStatusBuckets, myAnswer?: string | null): string {
+  const L = answerLabels();
   const fmt = (users: string[]) => `-# ${users.length > 0 ? users.join('、') : '(なし)'}`;
   const mine = myAnswer === undefined ? '' : `👤 あなたの回答: **${answerEmojiLabel(myAnswer, L)}**\n\n`;
   return (
-    `📅 **${title} の${head}**\n\n` +
+    `📅 **${title} の参加状況**\n\n` +
     mine +
     `⭕ **${L.participate} (${s.参加.length}名)**\n${fmt(s.参加)}\n\n` +
     `❌ **${L.absent} (${s.不参加.length}名)**\n${fmt(s.不参加)}\n\n` +
     `❓ **${L.undecided} (${s.未定.length}名)**\n${fmt(s.未定)}\n\n` +
     `⚠️ **未回答 (${s.未回答.length}名)**\n${fmt(s.未回答)}`
   );
-}
-
-/**
- * 単発の複数候補の状況を 1 メッセージにまとめる（statusall ボタン用）。
- * Discord のメッセージ上限(2000字)に収まるよう、超えそうなら残りを「…ほか N 件」に要約する。
- * 行に mine があれば（null=未回答含む）候補ごとの自分の回答を末尾に付ける。
- */
-export function buildAllStatusMessage(
-  notificationName: string,
-  rows: { label: string; buckets: EventStatusBuckets; mine?: string | null }[],
-  type: NotificationType = 'recurring',
-): string {
-  const L = answerLabels(type);
-  const MAX = 1900; // 2000 字制限に対する安全マージン
-  let msg = `📊 **${notificationName} の候補別 状況**\n`;
-  let shown = 0;
-  for (const r of rows) {
-    const mine = r.mine === undefined ? '' : ` ｜ 👤 あなた: ${answerEmojiLabel(r.mine, L)}`;
-    const line =
-      `\n🗓️ **${r.label}**\n` +
-      `　${L.participate} ${r.buckets.参加.length} / ${L.absent} ${r.buckets.不参加.length} / ` +
-      `${L.undecided} ${r.buckets.未定.length} / 未回答 ${r.buckets.未回答.length}${mine}`;
-    // 最低 1 件は必ず出す。以降は上限を超える行が来たら残数を要約して打ち切る。
-    if (shown > 0 && msg.length + line.length > MAX) {
-      msg += `\n\n…ほか ${rows.length - shown} 件（長いため省略）`;
-      break;
-    }
-    msg += line;
-    shown++;
-  }
-  return msg;
 }
 
 async function postMessage(

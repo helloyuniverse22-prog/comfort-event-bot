@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { nextOccurrenceDate, nextOccurrenceDates, buildRRule } from '../src/lib/recurrence';
+import { nextOccurrenceDate, nextOccurrenceDates, buildRRule, occurrenceDatesBetween, anchorMatchesRule, alignDtstart } from '../src/lib/recurrence';
 import type { Notification } from '../src/db/types';
 
 // nextOccurrenceDate は内部で rrule を JST 壁時計で評価する。
@@ -21,13 +21,15 @@ function makeNotification(over: Partial<Notification>): Notification {
     channel_id: 'c1',
     type: 'recurring',
     rrule: null,
-    one_off_date: null,
     anchor_date: null,
     start_time: '21:00',
     duration_minutes: null,
     recruit_days_before: 7,
     remind_start_days: 3,
     remind_undecided_days: 1,
+    recruit_enabled: 1,
+    remind_unanswered_enabled: 1,
+    remind_undecided_enabled: 1,
     quota_enabled: 0,
     quota_interval_days: null,
     assignment_enabled: 0,
@@ -38,7 +40,6 @@ function makeNotification(over: Partial<Notification>): Notification {
     message_title: 'テスト通知',
     message_body: null,
     active: 1,
-    decided_occurrence_id: null,
     response_deadline_hours: null,
     change_alert_channel_id: null,
     grouping_channel_id: null,
@@ -176,27 +177,8 @@ describe('nextOccurrenceDate - anchor_date（隔週パリティ / 未来anchor�
   });
 });
 
-describe('nextOccurrenceDate - 単発（oneoff）', () => {
-  it('one_off_date をそのまま返す（未来）', () => {
-    const n = makeNotification({ type: 'oneoff', rrule: null, one_off_date: '2025/03/20' });
-    const now = new Date(2025, 0, 1, 10, 0);
-    expect(nextOccurrenceDate(n, now)).toBe('2025/03/20');
-  });
-
-  it('過去の one_off_date でもそのまま返す（判定は呼び出し側）', () => {
-    const n = makeNotification({ type: 'oneoff', rrule: null, one_off_date: '2024/12/01' });
-    const now = new Date(2025, 0, 1, 10, 0);
-    expect(nextOccurrenceDate(n, now)).toBe('2024/12/01');
-  });
-
-  it('one_off_date 未設定なら null', () => {
-    const n = makeNotification({ type: 'oneoff', rrule: null, one_off_date: null });
-    expect(nextOccurrenceDate(n, new Date(2025, 0, 1, 10, 0))).toBeNull();
-  });
-});
-
-describe('nextOccurrenceDate - recurring の異常系', () => {
-  it('rrule 未設定なら null', () => {
+describe('nextOccurrenceDate - 異常系', () => {
+  it('rrule 未設定（不定期）なら null', () => {
     const n = makeNotification({ type: 'recurring', rrule: null });
     expect(nextOccurrenceDate(n, new Date(2025, 0, 1, 10, 0))).toBeNull();
   });
@@ -273,13 +255,228 @@ describe('nextOccurrenceDates（複数件の未来開催日・配信予定の仮
     expect(nextOccurrenceDates(n, 3, now)).toEqual(['2025/01/04', '2025/01/18', '2025/02/01']);
   });
 
-  it('oneoff は one_off_date の 1 件のみ（count に関わらず）', () => {
-    const n = makeNotification({ type: 'oneoff', rrule: null, one_off_date: '2025/02/01' });
-    expect(nextOccurrenceDates(n, 5, new Date(2025, 0, 1))).toEqual(['2025/02/01']);
-  });
-
   it('rrule 無し/不正は空配列', () => {
     expect(nextOccurrenceDates(makeNotification({ rrule: null }), 3, new Date(2025, 0, 1))).toEqual([]);
     expect(nextOccurrenceDates(makeNotification({ rrule: 'BYDAY=SA' }), 3, new Date(2025, 0, 1))).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// 以下は繰り返し柔軟化（docs/dev/schedule-recurrence-redesign.md・2026-08-23）Phase 1 で追加。
+// 基準日メモ: 2026/09/01 = 火 / 9/5 = 土 / 9/6 = 日 / 9/12 = 第2土 / 2027/01/09 = 第2土 / 2028 はうるう年。
+// ---------------------------------------------------------------------------------------------
+
+const rec = (over: Partial<Notification>) => makeNotification({ type: 'recurring', start_time: '21:00', ...over });
+
+describe('17 パターン - 新 FREQ の評価（INTERVAL=1・位相なし）', () => {
+  it('毎日（FREQ=DAILY）: 当日ロジックを含め連日', () => {
+    const n = rec({ rrule: 'FREQ=DAILY' });
+    expect(nextOccurrenceDates(n, 3, new Date(2026, 8, 1, 10, 0))).toEqual(['2026/09/01', '2026/09/02', '2026/09/03']);
+    expect(nextOccurrenceDates(n, 3, new Date(2026, 8, 1, 22, 0))).toEqual(['2026/09/02', '2026/09/03', '2026/09/04']);
+  });
+
+  it('平日（BYDAY=MO,TU,WE,TH,FR）: 金曜 → 金・月・火', () => {
+    const n = rec({ rrule: 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR' });
+    expect(nextOccurrenceDates(n, 3, new Date(2026, 8, 4, 10, 0))).toEqual(['2026/09/04', '2026/09/07', '2026/09/08']);
+  });
+
+  it('毎週 複数曜日（BYDAY=SA,SU）', () => {
+    const n = rec({ rrule: 'FREQ=WEEKLY;BYDAY=SA,SU' });
+    expect(nextOccurrenceDates(n, 3, new Date(2026, 8, 1, 10, 0))).toEqual(['2026/09/05', '2026/09/06', '2026/09/12']);
+  });
+
+  it('毎月 日付 複数（BYMONTHDAY=1,15）', () => {
+    const n = rec({ rrule: 'FREQ=MONTHLY;BYMONTHDAY=1,15' });
+    expect(nextOccurrenceDates(n, 3, new Date(2026, 8, 2, 10, 0))).toEqual(['2026/09/15', '2026/10/01', '2026/10/15']);
+  });
+
+  it('月末（BYMONTHDAY=-1）: 30/31/28 日を月ごとに', () => {
+    const n = rec({ rrule: 'FREQ=MONTHLY;BYMONTHDAY=-1' });
+    expect(nextOccurrenceDates(n, 6, new Date(2026, 8, 1, 10, 0))).toEqual([
+      '2026/09/30',
+      '2026/10/31',
+      '2026/11/30',
+      '2026/12/31',
+      '2027/01/31',
+      '2027/02/28',
+    ]);
+  });
+
+  it('31 日（BYMONTHDAY=31）: 31 日が無い月はスキップ（RFC どおり・繰り上げない）', () => {
+    const n = rec({ rrule: 'FREQ=MONTHLY;BYMONTHDAY=31' });
+    expect(nextOccurrenceDates(n, 3, new Date(2026, 8, 1, 10, 0))).toEqual(['2026/10/31', '2026/12/31', '2027/01/31']);
+  });
+
+  it('毎年（BYMONTH=3;BYMONTHDAY=20）', () => {
+    const n = rec({ rrule: 'FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=20' });
+    expect(nextOccurrenceDates(n, 2, new Date(2026, 8, 1, 10, 0))).toEqual(['2027/03/20', '2028/03/20']);
+  });
+
+  it('毎年 2/29: うるう年のみ', () => {
+    const n = rec({ rrule: 'FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29' });
+    expect(nextOccurrenceDates(n, 2, new Date(2026, 8, 1, 10, 0))).toEqual(['2028/02/29', '2032/02/29']);
+  });
+
+  it('最終金曜（BYDAY=-1FR）', () => {
+    const n = rec({ rrule: 'FREQ=MONTHLY;BYDAY=-1FR' });
+    expect(nextOccurrenceDates(n, 3, new Date(2026, 8, 1, 10, 0))).toEqual(['2026/09/25', '2026/10/30', '2026/11/27']);
+  });
+
+  it('INTERVAL=1 では anchor_date は位相に影響しない（未来 anchor でも直近の回を返す）', () => {
+    const base = { rrule: 'FREQ=MONTHLY;BYMONTHDAY=15' };
+    const now = new Date(2026, 8, 1, 10, 0);
+    expect(nextOccurrenceDate(rec({ ...base, anchor_date: '2026/12/15' }), now)).toBe('2026/09/15');
+    expect(nextOccurrenceDate(rec({ ...base, anchor_date: null }), now)).toBe('2026/09/15');
+  });
+});
+
+describe('17 パターン - INTERVAL>=2 の位相（anchor_date = 次回の開催日）', () => {
+  it('N 日おき（DAILY;INTERVAL=3）: 未来 anchor はそのまま・過去 anchor は位相維持で前進', () => {
+    const n = rec({ rrule: 'FREQ=DAILY;INTERVAL=3', anchor_date: '2026/09/04' });
+    expect(nextOccurrenceDates(n, 3, new Date(2026, 8, 1, 10, 0))).toEqual(['2026/09/04', '2026/09/07', '2026/09/10']);
+    expect(nextOccurrenceDates(n, 3, new Date(2026, 8, 20, 10, 0))).toEqual(['2026/09/22', '2026/09/25', '2026/09/28']);
+  });
+
+  it('N 週おき（WEEKLY;INTERVAL=3）: 旧実装の 14 日巻き寄せでは崩れた位相が保たれる', () => {
+    const n = rec({ rrule: 'FREQ=WEEKLY;INTERVAL=3;BYDAY=SA', anchor_date: '2026/09/05' });
+    expect(nextOccurrenceDates(n, 4, new Date(2026, 8, 1, 10, 0))).toEqual([
+      '2026/09/05',
+      '2026/09/26',
+      '2026/10/17',
+      '2026/11/07',
+    ]);
+    expect(nextOccurrenceDates(n, 2, new Date(2026, 9, 1, 10, 0))).toEqual(['2026/10/17', '2026/11/07']);
+  });
+
+  it('隔月 第2土曜（MONTHLY;INTERVAL=2;BYDAY=2SA）: 月境界を跨いで評価しても位相が反転しない（実測 #11b の修正）', () => {
+    const n = rec({ rrule: 'FREQ=MONTHLY;INTERVAL=2;BYDAY=2SA', anchor_date: '2026/09/12' });
+    expect(nextOccurrenceDates(n, 3, new Date(2026, 7, 22, 10, 0))).toEqual(['2026/09/12', '2026/11/14', '2027/01/09']);
+    expect(nextOccurrenceDates(n, 2, new Date(2026, 11, 1, 10, 0))).toEqual(['2027/01/09', '2027/03/13']);
+  });
+
+  it('隔月 日付（MONTHLY;INTERVAL=2;BYMONTHDAY=1,15）: 次回の開催日より前の同月の日は含まない', () => {
+    const n = rec({ rrule: 'FREQ=MONTHLY;INTERVAL=2;BYMONTHDAY=1,15', anchor_date: '2026/09/15' });
+    expect(nextOccurrenceDates(n, 3, new Date(2026, 7, 20, 10, 0))).toEqual(['2026/09/15', '2026/11/01', '2026/11/15']);
+    // anchor が過去になったら月初に正規化して同月の回を取りこぼさない
+    expect(nextOccurrenceDates(n, 2, new Date(2026, 10, 5, 10, 0))).toEqual(['2026/11/15', '2027/01/01']);
+  });
+
+  it('N 年おき（YEARLY;INTERVAL=2）: 年境界を跨いでも位相が保たれる（実測 #23b の修正）', () => {
+    const n = rec({ rrule: 'FREQ=YEARLY;INTERVAL=2;BYMONTH=3;BYMONTHDAY=20', anchor_date: '2027/03/20' });
+    expect(nextOccurrenceDates(n, 2, new Date(2026, 0, 1, 10, 0))).toEqual(['2027/03/20', '2029/03/20']);
+    expect(nextOccurrenceDates(n, 2, new Date(2028, 0, 1, 10, 0))).toEqual(['2029/03/20', '2031/03/20']);
+  });
+
+  it('隔週 複数曜日: 次回の開催日より前の同じ週の曜日は含まない（Q6 注記・WKST=MO）', () => {
+    const sun = rec({ rrule: 'FREQ=WEEKLY;INTERVAL=2;BYDAY=SA,SU', anchor_date: '2026/09/06' });
+    expect(nextOccurrenceDates(sun, 4, new Date(2026, 8, 1, 10, 0))).toEqual([
+      '2026/09/06',
+      '2026/09/19',
+      '2026/09/20',
+      '2026/10/03',
+    ]);
+    const sat = rec({ rrule: 'FREQ=WEEKLY;INTERVAL=2;BYDAY=SA,SU', anchor_date: '2026/09/05' });
+    expect(nextOccurrenceDates(sat, 4, new Date(2026, 8, 1, 10, 0))).toEqual([
+      '2026/09/05',
+      '2026/09/06',
+      '2026/09/19',
+      '2026/09/20',
+    ]);
+    // anchor が過去になっても週の位相は維持（土日を同じ週として扱う）
+    expect(nextOccurrenceDates(sun, 2, new Date(2026, 8, 21, 10, 0))).toEqual(['2026/10/03', '2026/10/04']);
+  });
+
+  it('隔週 anchor 無し: 既定エポック 2000/01/01（土）の位相（既存行と同一）', () => {
+    const n = rec({ rrule: 'FREQ=WEEKLY;INTERVAL=2;BYDAY=SA' });
+    // 2000/01/01 から 2025/01/11 は 9142 日 = 14 × 653
+    expect(nextOccurrenceDates(n, 2, new Date(2025, 0, 1, 10, 0))).toEqual(['2025/01/11', '2025/01/25']);
+  });
+
+  it('隔週 未来 anchor は文字どおり次回（候補 3・4 番目＝15 日以上先を選んだときも手前の回を作らない）', () => {
+    const n = rec({ rrule: 'FREQ=WEEKLY;INTERVAL=2;BYDAY=SA', anchor_date: '2026/09/19' });
+    expect(nextOccurrenceDates(n, 2, new Date(2026, 8, 1, 10, 0))).toEqual(['2026/09/19', '2026/10/03']);
+  });
+});
+
+describe('alignDtstart - 起点の整列', () => {
+  const d = (y: number, m: number, day: number) => new Date(Date.UTC(y, m - 1, day));
+  it('INTERVAL=1 は境界日そのもの（anchor 無視・走査ゼロ）', () => {
+    expect(alignDtstart('WEEKLY', 1, d(2026, 12, 5), d(2026, 9, 1))).toEqual(d(2026, 9, 1));
+  });
+  it('境界以降の anchor はそのまま', () => {
+    expect(alignDtstart('WEEKLY', 2, d(2026, 9, 1), d(2026, 9, 1))).toEqual(d(2026, 9, 1));
+    expect(alignDtstart('WEEKLY', 2, d(2026, 9, 19), d(2026, 9, 1))).toEqual(d(2026, 9, 19));
+  });
+  it('過去の anchor は周期の倍数で (境界-周期, 境界] へ前進', () => {
+    expect(alignDtstart('DAILY', 3, d(2026, 9, 4), d(2026, 9, 20))).toEqual(d(2026, 9, 19));
+    expect(alignDtstart('WEEKLY', 2, d(2026, 9, 5), d(2026, 9, 21))).toEqual(d(2026, 9, 19));
+    expect(alignDtstart('WEEKLY', 2, d(2026, 9, 5), d(2026, 9, 19))).toEqual(d(2026, 9, 19));
+    expect(alignDtstart('WEEKLY', 3, d(2026, 9, 5), d(2026, 10, 1))).toEqual(d(2026, 9, 26));
+  });
+  it('月・年は月初・年初に正規化（境界と同じ月・年の回を取りこぼさない）', () => {
+    expect(alignDtstart('MONTHLY', 2, d(2026, 9, 12), d(2027, 1, 5))).toEqual(d(2027, 1, 1));
+    expect(alignDtstart('MONTHLY', 2, d(2026, 9, 12), d(2026, 12, 1))).toEqual(d(2026, 11, 1));
+    expect(alignDtstart('YEARLY', 2, d(2027, 3, 20), d(2028, 1, 1))).toEqual(d(2027, 1, 1));
+    expect(alignDtstart('YEARLY', 2, d(2027, 3, 20), d(2029, 5, 1))).toEqual(d(2029, 1, 1));
+  });
+  it('anchor 無しはエポック 2000/01/01 を同規則で整列', () => {
+    const r = alignDtstart('WEEKLY', 2, null, d(2025, 1, 1));
+    expect((d(2025, 1, 1).getTime() - r.getTime()) / 86_400_000).toBeLessThan(14);
+    expect((r.getTime() - Date.UTC(2000, 0, 1)) % (14 * 86_400_000)).toBe(0);
+  });
+});
+
+describe('occurrenceDatesBetween - 境界日から窓内の全ルール回（両端含む）', () => {
+  it('毎週土曜・14 日窓', () => {
+    const n = rec({ rrule: 'FREQ=WEEKLY;BYDAY=SA' });
+    expect(occurrenceDatesBetween(n, 14, new Date(2025, 0, 1, 10, 0))).toEqual(['2025/01/04', '2025/01/11']);
+  });
+  it('毎日・窓 2 日で 3 件（当日ロジック: 開始後は翌日から）', () => {
+    const n = rec({ rrule: 'FREQ=DAILY' });
+    expect(occurrenceDatesBetween(n, 2, new Date(2026, 8, 1, 10, 0))).toEqual(['2026/09/01', '2026/09/02', '2026/09/03']);
+    expect(occurrenceDatesBetween(n, 0, new Date(2026, 8, 1, 22, 0))).toEqual(['2026/09/02']);
+  });
+  it('先頭は nextOccurrenceDate と一致し、窓外は含まない', () => {
+    const n = rec({ rrule: 'FREQ=MONTHLY;INTERVAL=2;BYDAY=2SA', anchor_date: '2026/09/12' });
+    const now = new Date(2026, 7, 22, 10, 0);
+    expect(occurrenceDatesBetween(n, 7, now)).toEqual([]);
+    expect(occurrenceDatesBetween(n, 30, now)).toEqual(['2026/09/12']);
+    expect(occurrenceDatesBetween(n, 90, now)[0]).toBe(nextOccurrenceDate(n, now));
+  });
+  it('不定期（rrule 無し）・文法外は空', () => {
+    expect(occurrenceDatesBetween(rec({ rrule: null }), 30, new Date(2026, 8, 1))).toEqual([]);
+    expect(occurrenceDatesBetween(rec({ rrule: 'FREQ=DAILY;COUNT=3' }), 30, new Date(2026, 8, 1))).toEqual([]);
+  });
+});
+
+describe('文法外の rrule は評価しない（UNTIL/COUNT/複数行は文法で拒否）', () => {
+  const now = new Date(2026, 8, 1, 10, 0);
+  it.each([
+    'FREQ=WEEKLY;BYDAY=SA;COUNT=3',
+    'FREQ=WEEKLY;BYDAY=SA;UNTIL=20261231',
+    'DTSTART:20260901T000000Z\nRRULE:FREQ=DAILY',
+    'FREQ=MONTHLY;BYDAY=2SA;BYMONTHDAY=15',
+    'FREQ=MONTHLY',
+  ])('%s → []', (rrule) => {
+    expect(nextOccurrenceDates(rec({ rrule }), 3, now)).toEqual([]);
+  });
+});
+
+describe('anchorMatchesRule - anchor_date がルールの開催日か（API 検証用）', () => {
+  it.each<[string, string, boolean]>([
+    ['FREQ=WEEKLY;INTERVAL=2;BYDAY=SA', '2026/09/05', true],
+    ['FREQ=WEEKLY;INTERVAL=2;BYDAY=SA', '2026/09/06', false],
+    ['FREQ=WEEKLY;INTERVAL=2;BYDAY=SA,SU', '2026/09/06', true],
+    ['FREQ=MONTHLY;INTERVAL=2;BYDAY=2SA', '2026/09/12', true],
+    ['FREQ=MONTHLY;INTERVAL=2;BYDAY=2SA', '2026/09/05', false],
+    ['FREQ=MONTHLY;BYMONTHDAY=-1', '2026/09/30', true],
+    ['FREQ=MONTHLY;BYMONTHDAY=-1', '2026/09/29', false],
+    ['FREQ=YEARLY;INTERVAL=2;BYMONTH=2;BYMONTHDAY=29', '2028/02/29', true],
+    ['FREQ=YEARLY;INTERVAL=2;BYMONTH=2;BYMONTHDAY=29', '2027/02/28', false],
+    ['FREQ=DAILY;INTERVAL=3', '2026/09/04', true],
+    ['FREQ=DAILY;COUNT=3', '2026/09/04', false],
+    ['FREQ=WEEKLY;BYDAY=SA', 'invalid', false],
+  ])('%s × %s → %s', (rrule, anchor, ok) => {
+    expect(anchorMatchesRule(rrule, anchor)).toBe(ok);
   });
 });

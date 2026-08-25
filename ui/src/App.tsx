@@ -16,6 +16,7 @@ import {
 import {
   AuthError,
   GUILD_KEY,
+  api,
   clearToken,
   fetchGuilds,
   getToken,
@@ -28,7 +29,6 @@ import { ConfirmHost, confirmDialog } from './lib/dialog';
 import { parseHash, routeFromRest, sectionForRoute, type Route } from './lib/route';
 import { NotificationsScreen } from './screens/Notifications';
 import { NotifOps } from './screens/NotifOps';
-import { NotificationForm } from './screens/NotificationForm';
 import { NotificationFormV2 } from './screens/NotificationFormV2';
 import { GroupingDialog } from './screens/GroupingDialog';
 import { GroupingSettings } from './screens/GroupingSettings';
@@ -166,12 +166,22 @@ function Picker({
   onError: (e: unknown) => void;
 }) {
   const [guilds, setGuilds] = useState<Guild[] | null>(null);
-  useEffect(() => {
-    fetchGuilds().then(setGuilds, (e) => {
-      setGuilds([]);
-      onError(e);
-    });
-  }, [onError]);
+  // 参加サーバーが 0 件（初回・全退出後）のときだけ招待リンクを出す
+  const [invite, setInvite] = useState<string | null>(null);
+  const load = () => {
+    setGuilds(null);
+    fetchGuilds().then(
+      (g) => {
+        setGuilds(g);
+        if (g.length === 0) api('/setup/status').then((s) => setInvite(s?.invite_url ?? null), () => {});
+      },
+      (e) => {
+        setGuilds([]);
+        onError(e);
+      },
+    );
+  };
+  useEffect(load, [onError]);
   return (
     <div>
       <Topbar>
@@ -185,7 +195,27 @@ function Picker({
           {guilds === null ? (
             <p className="muted">読み込み中…</p>
           ) : guilds.length === 0 ? (
-            <p className="muted">参加サーバーが取得できませんでした。bot トークン / 権限を確認してください。</p>
+            <div>
+              <p className="muted">参加サーバーが取得できませんでした。bot トークン / 権限を確認してください。</p>
+              {invite && (
+                <p className="muted">
+                  Bot をまだサーバーに招待していない場合は{' '}
+                  <a href={invite} target="_blank" rel="noreferrer">
+                    招待リンクを開く
+                  </a>
+                  （招待後に「再読み込み」）。
+                </p>
+              )}
+              <button
+                className="btn sm secondary"
+                onClick={() => {
+                  invalidateGuilds();
+                  load();
+                }}
+              >
+                再読み込み
+              </button>
+            </div>
           ) : (
             guilds.map((g) => (
               <div key={g.id} className="card" onClick={() => onSelect(g)}>
@@ -291,28 +321,12 @@ function Workspace({
     switch (route.kind) {
       case 'notif-new':
         return (
-          <NotificationForm key="new" guild={guild} toast={toast} onDirtyChange={setDirty} onClose={backToList} onSaved={backToList} />
-        );
-      case 'notif-new2':
-        return (
-          <NotificationFormV2 key="new2" guild={guild} toast={toast} onDirtyChange={setDirty} onClose={backToList} onSaved={backToList} />
+          <NotificationFormV2 key="new" guild={guild} toast={toast} onDirtyChange={setDirty} onClose={backToList} onSaved={backToList} />
         );
       case 'notif-edit':
         return (
-          <NotificationForm
-            key={route.nuuid}
-            guild={guild}
-            nuuid={route.nuuid}
-            toast={toast}
-            onDirtyChange={setDirty}
-            onClose={backToList}
-            onSaved={backToList}
-          />
-        );
-      case 'notif-edit2':
-        return (
           <NotificationFormV2
-            key={'v2-' + route.nuuid}
+            key={route.nuuid}
             guild={guild}
             nuuid={route.nuuid}
             toast={toast}
@@ -395,8 +409,8 @@ function Workspace({
                 guild={guild}
                 toast={toast}
                 onError={onError}
-                onNew={(v2) => navigate(v2 ? 'notifications/new2' : 'notifications/new')}
-                onEdit={(uuid, v2) => navigate(`notifications/${uuid}/${v2 ? 'edit2' : 'edit'}`)}
+                onNew={() => navigate('notifications/new')}
+                onEdit={(uuid) => navigate(`notifications/${uuid}/edit`)}
                 onGroupingSettings={(uuid) => navigate(`notifications/${uuid}/grouping-settings`)}
               />
             ) : sec === 'segments' ? (

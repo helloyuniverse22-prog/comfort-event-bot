@@ -1,11 +1,11 @@
 // スケジュール設定（マスター一覧）。新規/編集/メンバー配置設定は子ページへ遷移（ADR 0016）、
-// 投稿/削除はその場でアクション。Phase 4 ブループリント（.design-sync/templates/NotificationList.dc.html）準拠。
+// 削除はその場でアクション（今すぐ募集/告知は開催回タブに一本化・2026-08-23）。Phase 4 ブループリント（.design-sync/templates/NotificationList.dc.html）準拠。
 import * as React from 'react';
 import { useEffect, useState } from 'react';
-import { Actions, Pill, Switch } from '../../../design-system/src';
+import { Actions, Pill } from '../../../design-system/src';
 import { api, type Guild } from '../api';
-import { confirmDialog, withBusy } from '../lib/dialog';
-import { fmtTimeRange, humanRRule } from '../lib/rrule';
+import { confirmDialog } from '../lib/dialog';
+import { describeRule, parseRule } from '../lib/rrule';
 import type { ToastFn } from '../App';
 
 type Segment = { id: string; name: string };
@@ -13,15 +13,12 @@ type Channel = { id: string; name: string };
 type Notification = {
   uuid: string;
   name: string;
-  type: 'oneoff' | 'recurring' | string;
+  /** null = 不定期（ルールなし・開催回は手動追加） */
   rrule?: string | null;
   start_time?: string | null;
   duration_minutes?: number | null;
-  one_off_date?: string | null;
-  decided_occurrence_id?: string | null;
-  decided_date?: string | null;
-  decided_time?: string | null;
-  candidate_count?: number | null;
+  /** 今日以降の直近の予定回（不定期の「次回」表示用・LIST_EXTRA） */
+  next_occurrence_date?: string | null;
   segment_id: string;
   channel_id: string;
   requires_response?: number;
@@ -39,16 +36,10 @@ type Estimate = {
 
 type Filter = 'all' | 'on' | 'off';
 
-function oneoffSched(n: Notification): string {
-  const earliest = `${n.one_off_date || ''}${n.start_time ? ' ' + fmtTimeRange(n.start_time, n.duration_minutes) : ''}`;
-  if (n.decided_occurrence_id && n.decided_date) {
-    return `単発・確定 ${n.decided_date}${n.decided_time ? ' ' + fmtTimeRange(n.decided_time, n.duration_minutes) : ''}`;
-  }
-  if ((n.candidate_count || 0) > 1) return `単発・調整中（候補${n.candidate_count}件・最早 ${earliest}）`;
-  return `単発 ${earliest}`;
-}
+/** 一覧の要約（定期=ルールの自然文／不定期=「不定期 21:00〜（次回 9/9）」。文法外は注意表示） */
 function schedText(n: Notification): string {
-  return n.type === 'oneoff' ? oneoffSched(n) : humanRRule(n.rrule, n.start_time, n.duration_minutes);
+  if (n.rrule && !parseRule(n.rrule)) return '⚠️ 繰り返し設定を読み取れません（編集して設定し直してください）';
+  return describeRule(parseRule(n.rrule), n.start_time, n.duration_minutes, n.rrule ? null : n.next_occurrence_date);
 }
 
 export function NotificationsScreen({
@@ -62,8 +53,8 @@ export function NotificationsScreen({
   guild: Guild;
   toast: ToastFn;
   onError: (e: unknown) => void;
-  onNew: (v2?: boolean) => void;
-  onEdit: (uuid: string, v2?: boolean) => void;
+  onNew: () => void;
+  onEdit: (uuid: string) => void;
   onGroupingSettings: (uuid: string) => void;
 }) {
   const [segs, setSegs] = useState<Segment[]>([]);
@@ -71,12 +62,6 @@ export function NotificationsScreen({
   const [channels, setChannels] = useState<Channel[]>([]);
   const [est, setEst] = useState<Estimate | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
-  // 新デザインのフォーム（v2）を使うか。現行フォームと並存中の切替スイッチ。
-  const [formV2, setFormV2] = useState(() => localStorage.getItem('eb.formV2') === '1');
-  const toggleFormV2 = (on: boolean) => {
-    setFormV2(on);
-    localStorage.setItem('eb.formV2', on ? '1' : '0');
-  };
 
   const load = async () => {
     try {
@@ -115,26 +100,6 @@ export function NotificationsScreen({
     return c ? '#' + c.name : id;
   };
 
-  const recruit = async (btn: HTMLElement | null, n: Notification) => {
-    // 出欠確認なし（告知のみ）のスケジュールは操作名も「告知」で統一する（用語は CONTEXT.md）
-    const noun = n.requires_response === 0 ? '告知' : '募集';
-    const ok = await confirmDialog(
-      noun === '告知'
-        ? 'このスケジュールの開催告知を今すぐチャンネルへ投稿しますか？'
-        : 'このスケジュールの募集メッセージを今すぐチャンネルへ投稿しますか？',
-      { title: `今すぐ${noun}`, okLabel: '投稿する' },
-    );
-    if (!ok) return;
-    await withBusy(btn, async () => {
-      try {
-        const r = await api('/notifications/' + n.uuid + '/recruit', { method: 'POST' });
-        toast(r && r.message ? r.message : `${noun}メッセージを投稿しました`);
-      } catch (e) {
-        toast(e instanceof Error ? e.message : String(e), true);
-      }
-    });
-  };
-
   const remove = async (uuid: string) => {
     const ok = await confirmDialog('このスケジュールを、配下の開催日・回答ごとすべて削除します。元に戻せません。', { danger: true, okLabel: '削除する' });
     if (!ok) return;
@@ -170,7 +135,7 @@ export function NotificationsScreen({
 
       <div className="sec-head">
         <h2>スケジュール設定 ({notifs.length})</h2>
-        <button className="btn" disabled={!segs.length} onClick={() => onNew(formV2)}>
+        <button className="btn" disabled={!segs.length} onClick={() => onNew()}>
           ＋ 新規スケジュール
         </button>
       </div>
@@ -188,10 +153,6 @@ export function NotificationsScreen({
             {label}
           </button>
         ))}
-        <label style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer' }}>
-          <span className="muted">✨ 新デザインのフォームを使う</span>
-          <Switch aria-label="新デザインのフォームを使う" checked={formV2} onChange={(e) => toggleFormV2(e.target.checked)} />
-        </label>
       </Actions>
 
       {shown.length === 0 ? (
@@ -221,13 +182,10 @@ export function NotificationsScreen({
               </div>
               <Actions>
                 <Pill tone={n.active ? 'on' : 'off'}>{n.active ? '有効' : '無効'}</Pill>
-                <button className="btn sm ghost" onClick={(e) => recruit(e.currentTarget, n)}>
-                  📣 今すぐ{n.requires_response === 0 ? '告知' : '募集'}
-                </button>
                 <button className="btn sm ghost" onClick={() => onGroupingSettings(n.uuid)}>
                   メンバー配置設定
                 </button>
-                <button className="btn sm ghost" onClick={() => onEdit(n.uuid, formV2)}>
+                <button className="btn sm ghost" onClick={() => onEdit(n.uuid)}>
                   編集
                 </button>
                 <button className="btn sm ghost danger" onClick={() => remove(n.uuid)}>

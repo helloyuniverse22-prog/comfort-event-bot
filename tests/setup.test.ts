@@ -23,6 +23,15 @@ describe('getSetupStatus', () => {
     expect(st.admin_url).toBe('https://example.workers.dev/');
   });
 
+  it('招待 URL はアプリ ID から派生（bot＋applications.commands・権限 134144）。未設定なら null', () => {
+    const st = getSetupStatus(makeEnv(), new Request('https://x.dev/api/admin/setup/status'));
+    expect(st.invite_url).toBe(
+      'https://discord.com/oauth2/authorize?client_id=aid&scope=bot%20applications.commands&permissions=134144',
+    );
+    const none = getSetupStatus(makeEnv({ DISCORD_APPLICATION_ID: '' }), new Request('https://x.dev/api/admin/setup/status'));
+    expect(none.invite_url).toBeNull();
+  });
+
   it('シークレット未設定は false、設定済みは true（値は返さない）', () => {
     const st = getSetupStatus(
       makeEnv({ DISCORD_BOT_TOKEN: '' }),

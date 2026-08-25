@@ -108,6 +108,9 @@ describe('inSendWindow（送信窓の事前判定）', () => {
     recruit_days_before: 7,
     remind_start_days: 3,
     remind_undecided_days: 1,
+    recruit_enabled: 1,
+    remind_unanswered_enabled: 1,
+    remind_undecided_enabled: 1,
     requires_response: 1,
     response_deadline_hours: null,
   };
@@ -130,6 +133,26 @@ describe('inSendWindow（送信窓の事前判定）', () => {
 
   it('リマインド窓が募集窓より広い設定も拾う', () => {
     expect(inSendWindow(n({ remind_start_days: 10 }), 9)).toBe(true);
+  });
+
+  it('工程スイッチ OFF（ADR 0026）: その工程は窓に数えない・数値は残っていても無視', () => {
+    // 募集 OFF（手動投稿）: 募集窓は無効。リマインド窓だけ残る
+    const manual = n({ recruit_enabled: 0 });
+    expect(inSendWindow(manual, 7)).toBe(false);
+    expect(inSendWindow(manual, 3)).toBe(true); // 未回答リマインド
+    // リマインド両方 OFF: 募集窓だけ
+    const noRemind = n({ remind_unanswered_enabled: 0, remind_undecided_enabled: 0, remind_start_days: 30, remind_undecided_days: 20 });
+    expect(inSendWindow(noRemind, 20)).toBe(false);
+    expect(inSendWindow(noRemind, 7)).toBe(true);
+    // 未定だけ OFF: その日ちょうどでも拾わない
+    expect(inSendWindow(n({ remind_undecided_enabled: 0, remind_undecided_days: 9 }), 9)).toBe(false);
+    // 全部 OFF・締切なし: 何も送らない
+    expect(inSendWindow(n({ recruit_enabled: 0, remind_unanswered_enabled: 0, remind_undecided_enabled: 0 }), 0)).toBe(false);
+  });
+
+  it('回答締切の監視窓は募集窓に同じ（締切あり ⇒ 定期 ⇒ 募集自動、が DB の不変条件・migration 0025）', () => {
+    expect(inSendWindow(n({ remind_unanswered_enabled: 0, remind_undecided_enabled: 0, response_deadline_hours: 30 }), 7)).toBe(true);
+    expect(inSendWindow(n({ remind_unanswered_enabled: 0, remind_undecided_enabled: 0, response_deadline_hours: 30 }), 8)).toBe(false);
   });
 });
 

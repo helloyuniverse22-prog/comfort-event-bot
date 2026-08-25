@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { answerLabels, buildAllStatusMessage, buildStatusMessage } from '../src/discord/rest';
+import { answerLabels, buildStatusMessage, createButtonComponents } from '../src/discord/rest';
 import type { EventStatusBuckets } from '../src/db/types';
 
 /** バケットを件数だけ指定して組み立てるヘルパ */
@@ -11,88 +11,45 @@ const bk = (a = 0, x = 0, u = 0, n = 0): EventStatusBuckets => ({
 });
 
 describe('answerLabels', () => {
-  it('oneoff は 可/不可/未確定', () => {
-    expect(answerLabels('oneoff')).toEqual({ participate: '可', absent: '不可', undecided: '未確定' });
-  });
-  it('recurring は 参加/不参加/未定', () => {
-    expect(answerLabels('recurring')).toEqual({ participate: '参加', absent: '不参加', undecided: '未定' });
+  it('参加/不参加/未定（旧 oneoff の 可/不可/未確定 は廃止）', () => {
+    expect(answerLabels()).toEqual({ participate: '参加', absent: '不参加', undecided: '未定' });
   });
 });
 
-describe('buildStatusMessage（種別で見出し・回答ラベル切替）', () => {
-  it('oneoff は「調整状況」＋可/不可/未確定', () => {
-    const msg = buildStatusMessage('2026/06/19 (金) 21:00〜23:00', bk(1, 0, 2, 0), 'oneoff');
-    expect(msg).toContain('調整状況');
-    expect(msg).toContain('可 (1名)');
-    expect(msg).toContain('未確定 (2名)');
+describe('createButtonComponents', () => {
+  it('回答 3 ボタン＋状況確認。custom_id は {action}_{occurrenceId}', () => {
+    const rows = createButtonComponents(42) as { components: { label: string; custom_id: string }[] }[];
+    expect(rows[0].components.map((c) => c.custom_id)).toEqual([
+      'participate_42',
+      'absent_42',
+      'undecided_42',
+      'status_42',
+    ]);
+    expect(rows[0].components.map((c) => c.label)).toEqual(['参加', '不参加', '未定', '📊 状況確認']);
   });
-  it('recurring は「参加状況」＋参加/不参加/未定', () => {
-    const msg = buildStatusMessage('2026/06/20', bk(3, 1, 0, 2), 'recurring');
+  it('includeStatus=false で状況確認を省く', () => {
+    const rows = createButtonComponents(42, false) as { components: unknown[] }[];
+    expect(rows[0].components).toHaveLength(3);
+  });
+});
+
+describe('buildStatusMessage', () => {
+  it('「参加状況」＋参加/不参加/未定', () => {
+    const msg = buildStatusMessage('2026/06/20', bk(3, 1, 0, 2));
     expect(msg).toContain('参加状況');
     expect(msg).toContain('参加 (3名)');
   });
   it('名前一覧は subtext（-#）で表示する', () => {
-    const msg = buildStatusMessage('2026/06/20', bk(2, 0, 0, 1), 'recurring');
+    const msg = buildStatusMessage('2026/06/20', bk(2, 0, 0, 1));
     expect(msg).toContain('\n-# p、p');
     expect(msg).toContain('\n-# (なし)');
   });
   it('myAnswer を渡すと先頭に「あなたの回答」行が付く（null=未回答）', () => {
-    const answered = buildStatusMessage('2026/06/20', bk(1), 'recurring', '参加');
+    const answered = buildStatusMessage('2026/06/20', bk(1), '参加');
     expect(answered).toContain('👤 あなたの回答: **⭕ 参加**');
-    const unanswered = buildStatusMessage('2026/06/20', bk(1), 'recurring', null);
+    const unanswered = buildStatusMessage('2026/06/20', bk(1), null);
     expect(unanswered).toContain('👤 あなたの回答: **⚠️ 未回答**');
-    const omitted = buildStatusMessage('2026/06/20', bk(1), 'recurring');
+    const omitted = buildStatusMessage('2026/06/20', bk(1));
     expect(omitted).not.toContain('あなたの回答');
-  });
-  it('oneoff の「あなたの回答」は 可/不可/未確定 表記になる', () => {
-    const msg = buildStatusMessage('2026/06/20', bk(1), 'oneoff', '未定');
-    expect(msg).toContain('👤 あなたの回答: **❓ 未確定**');
-  });
-});
-
-describe('buildAllStatusMessage（全候補集計・2000字ガード）', () => {
-  it('候補ごとに oneoff ラベルで件数を出す', () => {
-    const msg = buildAllStatusMessage(
-      '調整',
-      [{ label: '2026/06/19 (金) 21:00〜23:00', buckets: bk(2, 1, 0, 3) }],
-      'oneoff',
-    );
-    expect(msg).toContain('調整 の候補別 状況');
-    expect(msg).toContain('2026/06/19 (金) 21:00〜23:00');
-    expect(msg).toContain('可 2 / 不可 1 / 未確定 0 / 未回答 3');
-  });
-
-  it('候補が多すぎる場合は 2000 字以内に収め、残りを要約する', () => {
-    const rows = Array.from({ length: 200 }, (_, i) => ({
-      label: `2026/07/${(i % 28) + 1} (金) 21:00〜23:00 ＜候補スロット ${i} の長いラベル＞`,
-      buckets: bk(1, 1, 1, 1),
-    }));
-    const msg = buildAllStatusMessage('多数候補', rows, 'oneoff');
-    expect(msg.length).toBeLessThanOrEqual(2000);
-    expect(msg).toContain('…ほか');
-    expect(msg).toContain('件（長いため省略）');
-  });
-
-  it('上限内なら全件出して要約は付かない', () => {
-    const rows = [
-      { label: 'A 21:00〜22:00', buckets: bk(1) },
-      { label: 'B 22:00〜23:00', buckets: bk(0, 1) },
-    ];
-    const msg = buildAllStatusMessage('少数', rows, 'oneoff');
-    expect(msg).not.toContain('…ほか');
-    expect(msg).toContain('A 21:00〜22:00');
-    expect(msg).toContain('B 22:00〜23:00');
-  });
-
-  it('mine があれば候補ごとに自分の回答を付ける（null=未回答・省略時は付かない）', () => {
-    const rows = [
-      { label: 'A', buckets: bk(1), mine: '参加' },
-      { label: 'B', buckets: bk(0, 1), mine: null },
-      { label: 'C', buckets: bk(0, 0, 1) },
-    ];
-    const msg = buildAllStatusMessage('回答付き', rows, 'oneoff');
-    expect(msg).toContain('👤 あなた: ⭕ 可');
-    expect(msg).toContain('👤 あなた: ⚠️ 未回答');
-    expect((msg.match(/👤/g) || []).length).toBe(2);
   });
 });
